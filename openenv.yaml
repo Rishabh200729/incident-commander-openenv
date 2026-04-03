@@ -1,0 +1,12 @@
+spec_version: 1
+name: incident_commander_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: "AI SRE Incident Commander — diagnose and resolve production microservices outages"
+inference_script: inference.py
+tasks:
+  - single_service_failure
+  - cascading_failure
+  - hidden_root_cause
