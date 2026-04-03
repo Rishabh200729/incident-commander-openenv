@@ -418,8 +418,4 @@ python -m pytest tests/test_environment.py::TestEasyTask -v
 python -m pytest tests/ -v --tb=long
 ```
 
----
 
-## 📜 License
-
-MIT
