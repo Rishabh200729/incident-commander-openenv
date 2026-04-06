@@ -4,7 +4,7 @@ An **OpenEnv-compliant** reinforcement learning environment where an AI agent pl
 
 The agent must triage alerts, inspect logs and metrics, identify the root cause, choose recovery actions, and restore the system to a healthy state.
 
-> **New here?** Read [guide.md](guide.md) for a complete walkthrough — it explains everything from scratch, including RL concepts.
+> **New here?** Read [architecture.md](architecture.md) for a complete walkthrough — it explains everything from scratch, including RL concepts.
 
 ---
 
