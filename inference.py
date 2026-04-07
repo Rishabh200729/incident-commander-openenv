@@ -54,8 +54,10 @@ except ImportError:
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-# HF_TOKEN is the primary key per hackathon spec; OPENAI_API_KEY as fallback
-API_KEY = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY") or "AIzaSyDyygKcNXZBMwuRY4MhAGX0B_ZzERKCSPg"
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+# Optional — if you use from_docker_image():
+LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
 BENCHMARK_NAME = "incident_commander_env"
 MAX_RETRIES = 3
@@ -417,11 +419,11 @@ def run_task(task_name: str, client: OpenAI) -> None:
 
 def main():
     """Run inference across all three tasks."""
-    if not API_KEY:
-        print("WARNING: No API key set. Set HF_TOKEN or OPENAI_API_KEY.", file=sys.stderr)
+    if not HF_TOKEN:
+        print("WARNING: No HF_TOKEN set. Set HF_TOKEN environment variable.", file=sys.stderr)
 
     client = OpenAI(
-        api_key=API_KEY or "sk-placeholder",
+        api_key=HF_TOKEN,
         base_url=API_BASE_URL,
     )
 
