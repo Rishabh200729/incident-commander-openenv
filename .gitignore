@@ -38,4 +38,3 @@ evals/
 *.md
 !README.md
 !architecture.md
-!decisions.md

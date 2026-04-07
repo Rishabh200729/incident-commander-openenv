@@ -13,7 +13,6 @@ project_memory.md
 *.md
 !README.md
 !architecture.md
-!decisions.md
 .DS_Store
 .env
 .env.local
