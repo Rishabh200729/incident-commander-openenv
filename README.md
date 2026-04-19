@@ -21,7 +21,7 @@ The agent must triage alerts, inspect logs and metrics, identify the root cause,
 
 ## 🎯 Motivation
 
-Real-world production incidents are high-stakes, time-critical events that require systematic reasoning. This environment simulates realistic outage scenarios with:
+Real-world production incidents are high-stakes, time critical events that require systematic reasoning. This environment simulates realistic outage scenarios with:
 
 - **Cascading failures** across dependent services
 - **Misleading symptoms** that require deep investigation
