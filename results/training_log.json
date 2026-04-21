@@ -1,17 +1,62 @@
 [
   {
     "step": 1,
-    "mean_reward": 0.41133333333333333,
-    "task": "cascading_failure"
+    "task": "single_service_failure",
+    "mean_score": 0.275,
+    "best_score": 0.75,
+    "scores": [
+      0.13,
+      0.75,
+      0.09,
+      0.13
+    ]
   },
   {
     "step": 2,
-    "mean_reward": 0.118,
-    "task": "hidden_root_cause"
+    "task": "cascading_failure",
+    "mean_score": 0.0483,
+    "best_score": 0.1133,
+    "scores": [
+      0.1133,
+      0.0133,
+      0.0133,
+      0.0533
+    ]
   },
   {
     "step": 3,
-    "mean_reward": 0.013333333333333336,
-    "task": "single_service_failure"
+    "task": "hidden_root_cause",
+    "mean_score": 0.0725,
+    "best_score": 0.12,
+    "scores": [
+      0.06,
+      0.09,
+      0.02,
+      0.12
+    ]
+  },
+  {
+    "step": 4,
+    "task": "single_service_failure",
+    "mean_score": 0.275,
+    "best_score": 0.75,
+    "scores": [
+      0.13,
+      0.75,
+      0.09,
+      0.13
+    ]
+  },
+  {
+    "step": 5,
+    "task": "cascading_failure",
+    "mean_score": 0.0483,
+    "best_score": 0.1133,
+    "scores": [
+      0.1133,
+      0.0133,
+      0.0133,
+      0.0533
+    ]
   }
 ]

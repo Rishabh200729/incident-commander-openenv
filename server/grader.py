@@ -134,7 +134,9 @@ def compute_step_reward(
             reward += 0.01
 
     # 3) Revenue loss penalty based on escalation tier (T2-8)
-    if curr_health < 0.95:
+    # Only apply if this step is NOT a correct recovery action (Audit Fix #6)
+    is_correct_recovery = action_str in task.correct_recovery_actions
+    if curr_health < 0.95 and not is_correct_recovery:
         revenue_penalty = REVENUE_LOSS_PER_STEP.get(escalation_tier, -0.005)
         reward += revenue_penalty
 

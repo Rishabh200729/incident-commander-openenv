@@ -218,7 +218,7 @@ class IncidentCommanderEnvironment:
         else:
             self._escalation_tier = 4
 
-        # Tier 2+: Root cause degrades further
+        # Tier 2+: Root cause degrades further (only if still unhealthy)
         if step > 3 and self._task:
             root_svc = self._services.get(self._task.root_cause_service)
             if root_svc and root_svc.status != ServiceStatusEnum.HEALTHY:
@@ -227,7 +227,7 @@ class IncidentCommanderEnvironment:
                 current_err = root_svc.error_rate
                 new_err = min(1.0, current_err + new_health_penalty * 0.5)
                 current_lat = root_svc.latency_ms
-                new_lat = current_lat * 1.05  # 5% latency increase per step
+                new_lat = min(30000.0, current_lat * 1.05)  # 5% increase, capped (Audit Fix #12)
 
                 updates = {"error_rate": round(new_err, 4), "latency_ms": round(new_lat, 1)}
 
@@ -238,18 +238,20 @@ class IncidentCommanderEnvironment:
 
                 self._services[self._task.root_cause_service] = root_svc.model_copy(update=updates)
 
-        # Tier 3+: Direct dependents start degrading
+        # Tier 3+: Direct dependents start degrading (only if root is still broken)
         if step > 7 and self._task:
             root_name = self._task.root_cause_service
-            dependents = REVERSE_DEPS.get(root_name, [])
-            for dep_name in dependents:
-                dep_svc = self._services.get(dep_name)
-                if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
-                    self._services[dep_name] = dep_svc.model_copy(update={
-                        "status": ServiceStatusEnum.DEGRADED,
-                        "error_rate": max(dep_svc.error_rate, 0.15),
-                        "latency_ms": max(dep_svc.latency_ms, 500.0),
-                    })
+            root_svc = self._services.get(root_name)
+            if root_svc and root_svc.status != ServiceStatusEnum.HEALTHY:
+                dependents = REVERSE_DEPS.get(root_name, [])
+                for dep_name in dependents:
+                    dep_svc = self._services.get(dep_name)
+                    if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
+                        self._services[dep_name] = dep_svc.model_copy(update={
+                            "status": ServiceStatusEnum.DEGRADED,
+                            "error_rate": max(dep_svc.error_rate, 0.15),
+                            "latency_ms": max(dep_svc.latency_ms, 500.0),
+                        })
 
         # Tier 4: Full cascade — all unhealthy services worsen
         if step > 12:
@@ -260,25 +262,20 @@ class IncidentCommanderEnvironment:
                         "error_rate": round(new_err, 4),
                     })
 
-        # Determine services at risk (about to degrade next step)
+        # Determine services at risk from ALL unhealthy services (Audit Fix #8)
+        # Derive from all unhealthy, not just root cause — avoids leaking root cause
         self._services_at_risk = []
-        if self._task:
-            root_name = self._task.root_cause_service
-            # Direct dependents that are still healthy
-            for dep_name in REVERSE_DEPS.get(root_name, []):
-                dep_svc = self._services.get(dep_name)
-                if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
-                    if step >= 6:  # they're about to degrade
-                        self._services_at_risk.append(dep_name)
-
-            # Second-order dependents at higher tiers
-            if step >= 10:
-                for dep_name in REVERSE_DEPS.get(root_name, []):
-                    for dep2_name in REVERSE_DEPS.get(dep_name, []):
-                        dep2_svc = self._services.get(dep2_name)
-                        if dep2_svc and dep2_svc.status == ServiceStatusEnum.HEALTHY:
-                            if dep2_name not in self._services_at_risk:
-                                self._services_at_risk.append(dep2_name)
+        if step >= 6:
+            unhealthy_names = [
+                name for name, svc in self._services.items()
+                if svc.status != ServiceStatusEnum.HEALTHY
+            ]
+            for unh_name in unhealthy_names:
+                for dep_name in REVERSE_DEPS.get(unh_name, []):
+                    dep_svc = self._services.get(dep_name)
+                    if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
+                        if dep_name not in self._services_at_risk:
+                            self._services_at_risk.append(dep_name)
 
     # ------------------------------------------------------------------
     # step()
@@ -314,8 +311,8 @@ class IncidentCommanderEnvironment:
         self._state.step_count += 1
         self._last_action_error = None
 
-        # --- Severity escalation tick (T2-8) ---
-        self._tick(self._state.step_count)
+        # NOTE: _tick() moved to AFTER action execution (Audit Fix #5)
+        # This ensures health_delta only reflects the agent's action, not escalation damage
 
         action_type = action.action_type.value
         service_name = action.service_name
@@ -396,19 +393,22 @@ class IncidentCommanderEnvironment:
             self._is_done = True
 
         elif action_type == "write_runbook":
-            # Agent writes runbook at end of episode (T2-7)
-            summary = action.metadata.get("summary", "") if action.metadata else ""
-            self._runbook_written = True
-            # Check if summary mentions the correct root cause
-            if self._task.root_cause_service.lower() in summary.lower():
-                self._runbook_correct = True
+            # Agent writes runbook — only meaningful at episode end (Audit Fix #7)
+            if self._is_done or self._state.step_count >= self._task.max_steps - 1:
+                summary = action.metadata.get("summary", "") if action.metadata else ""
+                self._runbook_written = True
+                if self._task.root_cause_service.lower() in summary.lower():
+                    self._runbook_correct = True
+            else:
+                self._last_action_error = "write_runbook only allowed on final step or after resolution"
 
         elif action_type == "do_nothing":
             pass  # literally nothing
 
         self._actions_history.append(action_str)
 
-        # --- Check if first fix action matches runbook suggestion (T2-7) ---
+        # --- Check if fix action matches any runbook suggestion (Audit Fix #9) ---
+        # Match any recovery action against any entry in the fix sequence
         if (
             not self._runbook_used
             and self._runbook_available
@@ -416,7 +416,7 @@ class IncidentCommanderEnvironment:
         ):
             for suggestion in self._runbook_suggestions:
                 fix_seq = suggestion.get("fix_sequence", [])
-                if fix_seq and action_str == fix_seq[0]:
+                if action_str in fix_seq:
                     self._runbook_used = True
                     break
 
@@ -442,6 +442,10 @@ class IncidentCommanderEnvironment:
             self._chaos_agent.force_inject("notification", self._services, "oom_crash")
             self._last_chaos_event = "notification"
             self._services = propagate_dependencies(self._services, self._task.name)
+
+        # --- Severity escalation tick AFTER action (Audit Fix #5) ---
+        # Run tick after action so health_delta reflects agent's impact, not escalation
+        self._tick(self._state.step_count)
 
         # Compute health and reward
         curr_health = compute_health_score(self._services)
@@ -527,8 +531,9 @@ class IncidentCommanderEnvironment:
         }
         self._state.incident_timeline = list(self._timeline)
 
-        # Auto-write runbook at episode end if agent didn't (T2-7)
-        if self._is_done and not self._runbook_written and self._task:
+        # Auto-write runbook at episode end if agent didn't (Audit Fix #10)
+        # Only auto-record successful episodes to avoid polluting memory
+        if self._is_done and not self._runbook_written and self._task and self._state.is_resolved:
             self._auto_write_runbook()
 
         return self._build_observation(

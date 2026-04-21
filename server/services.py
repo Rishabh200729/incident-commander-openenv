@@ -76,12 +76,14 @@ def _generate_misleading_logs(
     point at other services as the culprit, forcing the agent to
     cross-reference metrics rather than trust logs blindly.
     """
-    sec = random.randint(0, 10)
+    # Deterministic RNG seeded from service+step for reproducibility (Audit Fix #2)
+    _rng = random.Random(hash((service_name, "misleading", step)))
+    sec = _rng.randint(0, 10)
     ts = f"2026-04-03T10:{step:02d}:{sec:02d}Z"
 
     # Scapegoats: services to falsely blame
     scapegoats = [s for s in ALL_SERVICES if s != service_name]
-    scapegoat = random.choice(scapegoats)
+    scapegoat = _rng.choice(scapegoats)
 
     misleading = [
         f"[{ts}] ERROR {service_name}: Upstream dependency '{scapegoat}' returning invalid responses.",
@@ -113,8 +115,9 @@ def _apply_log_quality(
         return [f"[LOG UNAVAILABLE — {service_name} not responding]"], "empty"
 
     elif log_quality == "partial":
-        # Keep 40-60% of lines (drop 40-60%)
-        kept = [line for line in raw_logs if random.random() > 0.5]
+        # Keep 40-60% of lines deterministically (Audit Fix #2)
+        _rng = random.Random(hash((service_name, "partial", step)))
+        kept = [line for line in raw_logs if _rng.random() > 0.5]
         if not kept:
             kept = [raw_logs[0]] if raw_logs else ["[LOG PARTIAL — limited data available]"]
         # Truncate last entry mid-sentence to simulate incomplete flush
@@ -126,8 +129,9 @@ def _apply_log_quality(
 
     elif log_quality == "misleading":
         misleading = _generate_misleading_logs(service_name, step)
-        # Mix some real logs with misleading ones (30% real, 70% misleading)
-        real_sample = [l for l in raw_logs if random.random() > 0.7]
+        # Mix some real logs with misleading ones deterministically (Audit Fix #2)
+        _rng = random.Random(hash((service_name, "mix", step)))
+        real_sample = [l for l in raw_logs if _rng.random() > 0.7]
         combined = misleading + real_sample
         combined.sort()
         return combined, "misleading"
@@ -154,8 +158,9 @@ def generate_logs(
         return [f"[ERROR] Service '{service_name}' not found in cluster."], "full"
 
     logs: List[str] = []
-    # Primary telemetry logs occur early in the step window
-    sec = random.randint(0, 10)
+    # Deterministic RNG seeded from service+step for reproducibility (Audit Fix #11)
+    _rng = random.Random(hash((service_name, "logs", step)))
+    sec = _rng.randint(0, 10)
     ts = f"2026-04-03T10:{step:02d}:{sec:02d}Z"
 
     if svc.status == ServiceStatusEnum.DOWN:
@@ -216,14 +221,14 @@ def generate_logs(
             logs.append(f"[{ts}] WARN cache: Serving stale auth tokens — TTL not expired but tokens may be invalid.")
             logs.append(f"[{ts}] INFO cache: Hit rate: 78% — some requests bypass cache and hit auth directly.")
 
-    # Inject contextual noise (benign traffic) to test agent filtering
-    num_noise = random.randint(6, 12)
+    # Inject contextual noise deterministically (Audit Fix #11)
+    num_noise = _rng.randint(6, 12)
     for _ in range(num_noise):
-        n_sec = random.randint(0, 59)
+        n_sec = _rng.randint(0, 59)
         n_ts = f"2026-04-03T10:{step:02d}:{n_sec:02d}Z"
-        trace_id = str(uuid.uuid4())[:8]
-        status = random.choice([200, 200, 201, 204, 304, 404])
-        ms = random.randint(15, 120)
+        trace_id = f"{_rng.randint(0, 0xFFFFFFFF):08x}"
+        status = _rng.choice([200, 200, 201, 204, 304, 404])
+        ms = _rng.randint(15, 120)
         logs.append(f"[{n_ts}] INFO {service_name}: [trace={trace_id}] Handled incoming request -> HTTP {status} ({ms}ms)")
 
     # Sort lexicographically by timestamp string to interleave naturally
@@ -243,14 +248,15 @@ def generate_metrics(
     if svc is None:
         return {"error": f"Service '{service_name}' not found"}
 
-    # Add stochastic jitter to metrics
-    j_factor = random.uniform(0.95, 1.05)
-    j_add = random.uniform(-1.0, 1.0)
+    # Deterministic jitter seeded from service+task for reproducibility (Audit Fix #1)
+    _rng = random.Random(hash((service_name, task_name, svc.status.value)))
+    j_factor = _rng.uniform(0.95, 1.05)
+    j_add = _rng.uniform(-1.0, 1.0)
     
     # Degraded/down services experience chaotic jitter
     if svc.status != ServiceStatusEnum.HEALTHY:
-        j_factor = random.uniform(0.8, 1.4)
-        j_add = random.uniform(-5.0, 15.0)
+        j_factor = _rng.uniform(0.8, 1.4)
+        j_add = _rng.uniform(-5.0, 15.0)
 
     metrics: Dict[str, Any] = {
         "service": service_name,
@@ -259,12 +265,12 @@ def generate_metrics(
         "latency_p50_ms": round(max(1.0, svc.latency_ms * 0.6 * j_factor + j_add), 1),
         "latency_p95_ms": round(max(1.0, svc.latency_ms * j_factor + j_add), 1),
         "latency_p99_ms": round(max(1.0, svc.latency_ms * 1.4 * j_factor + j_add * 2), 1),
-        "cpu_percent": round(min(100.0, max(0.0, svc.cpu_percent + random.gauss(0, 2.0))), 1),
-        "memory_percent": round(min(100.0, max(0.0, svc.memory_percent + random.gauss(0, 0.5))), 1),
+        "cpu_percent": round(min(100.0, max(0.0, svc.cpu_percent + _rng.gauss(0, 2.0))), 1),
+        "memory_percent": round(min(100.0, max(0.0, svc.memory_percent + _rng.gauss(0, 0.5))), 1),
         "instances": svc.instances,
         "version": svc.version,
-        "requests_per_second": int((500 if svc.status == ServiceStatusEnum.HEALTHY else (200 if svc.status == ServiceStatusEnum.DEGRADED else 0)) * j_factor),
-        "open_connections": int((50 if svc.status == ServiceStatusEnum.HEALTHY else (180 if svc.status == ServiceStatusEnum.DEGRADED else 0)) * j_factor),
+        "requests_per_second": int((500 if svc.status == ServiceStatusEnum.HEALTHY else (200 if svc.status == ServiceStatusEnum.DEGRADED else 0)) * _rng.uniform(0.95, 1.05)),
+        "open_connections": int((50 if svc.status == ServiceStatusEnum.HEALTHY else (180 if svc.status == ServiceStatusEnum.DEGRADED else 0)) * _rng.uniform(0.95, 1.05)),
         "dependencies": DEPENDENCY_GRAPH.get(service_name, []),
         "dependents": REVERSE_DEPS.get(service_name, []),
     }

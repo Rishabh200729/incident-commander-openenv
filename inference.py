@@ -87,6 +87,7 @@ Your goal is to diagnose the root cause and restore the system to full health as
 - {"action_type": "clear_cache"}
 - {"action_type": "escalate"}
 - {"action_type": "do_nothing"}
+- {"action_type": "write_runbook", "metadata": {"summary": "<incident summary>"}}  (only on final step)
 
 ## Strategy
 1. First INSPECT logs and metrics of services showing errors
