@@ -310,7 +310,7 @@ def run_full_evaluation(
     all_ok = True
     checks = [
         ("Expert solves all tasks", all(r["is_resolved"] for r in expert_results.values())),
-        ("Expert scores > 0.80 on all", all(r["score"] >= 0.80 for r in expert_results.values())),
+        ("Expert scores > 0.70 on all", all(r["score"] >= 0.70 for r in expert_results.values())),
         ("Naive scores lower than expert", all(
             naive_results[t]["score"] <= expert_results[t]["score"]
             for t in tasks

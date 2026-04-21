@@ -65,16 +65,93 @@ def build_healthy_cluster(versions: Optional[Dict[str, str]] = None) -> Dict[str
 # Log generation (deterministic per service + scenario)
 # ---------------------------------------------------------------------------
 
+def _generate_misleading_logs(
+    service_name: str,
+    step: int,
+) -> List[str]:
+    """
+    Generate misleading logs that blame the wrong service.
+
+    Used for bad_deploy failure mode where the broken service's logs
+    point at other services as the culprit, forcing the agent to
+    cross-reference metrics rather than trust logs blindly.
+    """
+    sec = random.randint(0, 10)
+    ts = f"2026-04-03T10:{step:02d}:{sec:02d}Z"
+
+    # Scapegoats: services to falsely blame
+    scapegoats = [s for s in ALL_SERVICES if s != service_name]
+    scapegoat = random.choice(scapegoats)
+
+    misleading = [
+        f"[{ts}] ERROR {service_name}: Upstream dependency '{scapegoat}' returning invalid responses.",
+        f"[{ts}] WARN {service_name}: Possible issue in {scapegoat} — received malformed payload.",
+        f"[{ts}] ERROR {service_name}: Connection timeout to {scapegoat} after 5000ms — retrying.",
+        f"[{ts}] WARN {service_name}: Error rate correlates with {scapegoat} degradation.",
+        f"[{ts}] INFO {service_name}: Internal health checks passing — issue appears to be upstream.",
+    ]
+    return misleading
+
+
+def _apply_log_quality(
+    raw_logs: List[str],
+    log_quality: str,
+    service_name: str,
+    step: int,
+) -> tuple[List[str], str]:
+    """
+    Apply log quality degradation based on failure mode.
+
+    Returns (filtered_logs, quality_label).
+
+    - 'empty': Service too dead to emit logs (OOM-killed)
+    - 'partial': Logs truncated, 40-60% lines dropped
+    - 'misleading': Logs blame wrong service (bad deploys)
+    - 'full': Current behavior (healthy services)
+    """
+    if log_quality == "empty":
+        return [f"[LOG UNAVAILABLE — {service_name} not responding]"], "empty"
+
+    elif log_quality == "partial":
+        # Keep 40-60% of lines (drop 40-60%)
+        kept = [line for line in raw_logs if random.random() > 0.5]
+        if not kept:
+            kept = [raw_logs[0]] if raw_logs else ["[LOG PARTIAL — limited data available]"]
+        # Truncate last entry mid-sentence to simulate incomplete flush
+        if kept:
+            last = kept[-1]
+            cut_point = max(20, len(last) * 2 // 3)
+            kept[-1] = last[:cut_point] + "... [TRUNCATED]"
+        return kept, "partial"
+
+    elif log_quality == "misleading":
+        misleading = _generate_misleading_logs(service_name, step)
+        # Mix some real logs with misleading ones (30% real, 70% misleading)
+        real_sample = [l for l in raw_logs if random.random() > 0.7]
+        combined = misleading + real_sample
+        combined.sort()
+        return combined, "misleading"
+
+    # Default: full quality
+    return raw_logs, "full"
+
+
 def generate_logs(
     service_name: str,
     services: Dict[str, ServiceState],
     task_name: str,
     step: int,
-) -> List[str]:
-    """Generate realistic log lines for a service based on its current state and the task."""
+) -> tuple[List[str], str]:
+    """
+    Generate realistic log lines for a service based on its current state and the task.
+
+    Returns:
+        (log_lines, log_quality) tuple where log_quality is
+        'full' | 'partial' | 'empty' | 'misleading'.
+    """
     svc = services.get(service_name)
     if svc is None:
-        return [f"[ERROR] Service '{service_name}' not found in cluster."]
+        return [f"[ERROR] Service '{service_name}' not found in cluster."], "full"
 
     logs: List[str] = []
     # Primary telemetry logs occur early in the step window
@@ -152,7 +229,8 @@ def generate_logs(
     # Sort lexicographically by timestamp string to interleave naturally
     logs.sort()
 
-    return logs
+    # Apply log quality degradation based on service's log_quality property
+    return _apply_log_quality(logs, svc.log_quality, service_name, step)
 
 
 def generate_metrics(

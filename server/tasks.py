@@ -24,12 +24,13 @@ class TaskDefinition:
 
     name: str
     description: str
-    difficulty: str  # "easy", "medium", "hard"
+    difficulty: str  # "easy", "medium", "hard", "expert"
     max_steps: int
     root_cause_service: str
     root_cause_description: str
     correct_recovery_actions: List[str]   # ordered list of action strings
     initial_services: Dict[str, ServiceState]
+    time_limit_seconds: int = 180  # SLA time pressure (Easy=120, Medium=180, Hard=300)
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ def _build_easy_task() -> TaskDefinition:
             error_rate=1.0, latency_ms=0.0,
             cpu_percent=0.0, memory_percent=0.0,
             instances=0, version="v1.0.0",
+            log_quality="empty",  # OOM-killed — no logs available
         ),
         "auth": ServiceState(
             name="auth", status=ServiceStatusEnum.DEGRADED,
@@ -90,6 +92,7 @@ def _build_easy_task() -> TaskDefinition:
             "restart_service:cache",
         ],
         initial_services=services,
+        time_limit_seconds=120,
     )
 
 
@@ -105,6 +108,7 @@ def _build_medium_task() -> TaskDefinition:
             error_rate=0.25, latency_ms=4500.0,
             cpu_percent=92.0, memory_percent=85.0,
             instances=2, version="v1.0.0",
+            log_quality="partial",  # CPU spike — partial logs
         ),
         "cache": ServiceState(
             name="cache", status=ServiceStatusEnum.HEALTHY,
@@ -156,6 +160,7 @@ def _build_medium_task() -> TaskDefinition:
             "restart_service:checkout",
         ],
         initial_services=services,
+        time_limit_seconds=180,
     )
 
 
@@ -187,6 +192,7 @@ def _build_hard_task() -> TaskDefinition:
             error_rate=0.32, latency_ms=600.0,
             cpu_percent=45.0, memory_percent=40.0,
             instances=2, version="v2.2.0-rc1",  # <-- BAD DEPLOY
+            log_quality="misleading",  # Bad deploy — logs blame cache
         ),
         "notification": ServiceState(
             name="notification", status=ServiceStatusEnum.HEALTHY,
@@ -228,6 +234,7 @@ def _build_hard_task() -> TaskDefinition:
             "restart_service:checkout",
         ],
         initial_services=services,
+        time_limit_seconds=300,
     )
 
 
@@ -246,6 +253,7 @@ def _build_chaos_cascade_task() -> TaskDefinition:
             error_rate=0.90, latency_ms=9000.0,
             cpu_percent=98.0, memory_percent=95.0,
             instances=2, version="v1.0.0",
+            log_quality="empty",  # DB crashed — no logs
         ),
         "cache": ServiceState(
             name="cache", status=ServiceStatusEnum.HEALTHY,
@@ -300,6 +308,7 @@ def _build_chaos_cascade_task() -> TaskDefinition:
             "restart_service:notification",
         ],
         initial_services=services,
+        time_limit_seconds=300,
     )
 
 
@@ -318,6 +327,7 @@ def _build_multi_root_cause_task() -> TaskDefinition:
             error_rate=0.30, latency_ms=5000.0,
             cpu_percent=96.0, memory_percent=88.0,
             instances=2, version="v1.0.0",
+            log_quality="partial",  # CPU spike — partial logs
         ),
         "cache": ServiceState(
             name="cache", status=ServiceStatusEnum.HEALTHY,
@@ -330,6 +340,7 @@ def _build_multi_root_cause_task() -> TaskDefinition:
             error_rate=0.40, latency_ms=1200.0,
             cpu_percent=55.0, memory_percent=48.0,
             instances=2, version="v2.2.0-rc1",  # BAD DEPLOY
+            log_quality="misleading",  # Bad deploy — misleading logs
         ),
         "notification": ServiceState(
             name="notification", status=ServiceStatusEnum.HEALTHY,
@@ -373,6 +384,7 @@ def _build_multi_root_cause_task() -> TaskDefinition:
             "restart_service:checkout",
         ],
         initial_services=services,
+        time_limit_seconds=360,
     )
 
 
@@ -389,6 +401,7 @@ _FAILURE_PROFILES = {
         "cpu_percent": 0.0,
         "memory_percent": 0.0,
         "instances": 0,
+        "log_quality": "empty",  # OOM-killed — no logs available
     },
     "bad_deploy": {
         "status": ServiceStatusEnum.DEGRADED,
@@ -397,6 +410,7 @@ _FAILURE_PROFILES = {
         "cpu_percent": 50.0,
         "memory_percent": 45.0,
         "version": "v2.2.0-rc1",
+        "log_quality": "misleading",  # Bad deploy — logs blame other services
     },
     "cpu_spike": {
         "status": ServiceStatusEnum.DEGRADED,
@@ -404,6 +418,7 @@ _FAILURE_PROFILES = {
         "latency_ms": 4500.0,
         "cpu_percent": 95.0,
         "memory_percent": 82.0,
+        "log_quality": "partial",  # CPU spike — partial log output
     },
     "network_partition": {
         "status": ServiceStatusEnum.DOWN,
@@ -412,6 +427,7 @@ _FAILURE_PROFILES = {
         "cpu_percent": 5.0,
         "memory_percent": 20.0,
         "instances": 1,
+        "log_quality": "partial",  # Network partition — partial logs
     },
 }
 
@@ -477,6 +493,8 @@ def _build_random_task(seed: Optional[int] = None) -> TaskDefinition:
         root_updates["instances"] = failure_profile["instances"]
     if "version" in failure_profile:
         root_updates["version"] = failure_profile["version"]
+    if "log_quality" in failure_profile:
+        root_updates["log_quality"] = failure_profile["log_quality"]
 
     services[root_service] = services[root_service].model_copy(update=root_updates)
 
@@ -518,12 +536,15 @@ def _build_random_task(seed: Optional[int] = None) -> TaskDefinition:
     if total_broken <= 1:
         difficulty = "easy"
         max_steps = 15
+        time_limit = 120
     elif total_broken <= 2:
         difficulty = "medium"
         max_steps = 20
+        time_limit = 180
     else:
         difficulty = "hard"
         max_steps = 25
+        time_limit = 300
 
     mode_descriptions = {
         "oom": f"{root_service} crashed due to OOM — needs restart",
@@ -546,6 +567,7 @@ def _build_random_task(seed: Optional[int] = None) -> TaskDefinition:
         root_cause_description=mode_descriptions[failure_mode],
         correct_recovery_actions=recovery_actions,
         initial_services=services,
+        time_limit_seconds=time_limit,
     )
 
 

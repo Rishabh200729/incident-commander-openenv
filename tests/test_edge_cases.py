@@ -217,7 +217,7 @@ class TestFullRollouts:
         obs = env.step(IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name="cache"))
         assert obs.done is True
         grade = env.grade()
-        assert grade["score"] >= 0.90
+        assert grade["score"] >= 0.80  # adjusted for grader rebalance (Memory component)
         assert grade["is_resolved"] is True
 
     def test_expert_medium(self):

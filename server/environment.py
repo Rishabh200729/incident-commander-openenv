@@ -3,12 +3,19 @@ Incident Commander Environment — core environment logic.
 
 Implements reset(), step(), and state() following the OpenEnv specification.
 All state transitions are deterministic given the same seed and action sequence.
+
+Features:
+- Real-time severity escalation with revenue-loss-grounded rewards
+- Runbook memory for cross-episode institutional knowledge
+- Time bounding / SLA pressure (HTTP mode only)
+- Partial & noisy log support via log_quality
 """
 
 from __future__ import annotations
 
 import copy
 import random
+import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -24,6 +31,7 @@ from .models import (
 from .services import (
     ALL_SERVICES,
     DEPENDENCY_GRAPH,
+    REVERSE_DEPS,
     apply_clear_cache,
     apply_restart,
     apply_rollback,
@@ -38,6 +46,7 @@ from .services import (
 from .tasks import TaskDefinition, get_task, list_tasks
 from .grader import compute_step_reward, grade_episode
 from .chaos import ChaosAgent
+from .runbook import RunbookMemory, RunbookEntry
 
 
 class IncidentCommanderEnvironment:
@@ -45,10 +54,10 @@ class IncidentCommanderEnvironment:
     OpenEnv-compatible environment for production incident response simulation.
 
     The agent plays Incident Commander and must triage, diagnose, and resolve
-    a microservices outage across three difficulty levels.
+    a microservices outage across multiple difficulty levels.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, http_mode: bool = False) -> None:
         self._state: Optional[IncidentState] = None
         self._services: Dict[str, ServiceState] = {}
         self._task: Optional[TaskDefinition] = None
@@ -64,6 +73,24 @@ class IncidentCommanderEnvironment:
         self._chaos_mode: bool = False
         self._chaos_rng: random.Random = random.Random()
         self._last_chaos_event: Optional[str] = None
+
+        # Runbook memory — persistent across episodes (T2-7)
+        self._runbook_memory: RunbookMemory = RunbookMemory()
+        self._incident_fingerprint: str = ""
+        self._runbook_written: bool = False
+        self._runbook_correct: bool = False
+        self._runbook_available: bool = False
+        self._runbook_used: bool = False
+        self._runbook_suggestions: List[Dict[str, Any]] = []
+
+        # Severity escalation state (T2-8)
+        self._escalation_tier: int = 1
+        self._services_at_risk: List[str] = []
+
+        # Time bounding / SLA pressure (T2-5)
+        self._http_mode: bool = http_mode
+        self._episode_start_time: float = 0.0
+        self._last_step_time: float = 0.0
 
     # ------------------------------------------------------------------
     # reset()
@@ -129,6 +156,25 @@ class IncidentCommanderEnvironment:
             ],
         }]
 
+        # Severity escalation reset (T2-8)
+        self._escalation_tier = 1
+        self._services_at_risk = []
+
+        # Time bounding reset (T2-5)
+        self._episode_start_time = time.time()
+        self._last_step_time = self._episode_start_time
+
+        # Runbook memory — advance episode counter and do lookup (T2-7)
+        self._runbook_memory.advance_episode()
+        self._incident_fingerprint = self._runbook_memory.build_fingerprint(
+            self._task.root_cause_service, task_name
+        )
+        self._runbook_suggestions = self._runbook_memory.lookup(self._incident_fingerprint)
+        self._runbook_available = len(self._runbook_suggestions) > 0
+        self._runbook_written = False
+        self._runbook_correct = False
+        self._runbook_used = False
+
         self._state = IncidentState(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
@@ -140,7 +186,99 @@ class IncidentCommanderEnvironment:
             incident_timeline=list(self._timeline),
         )
 
-        return self._build_observation(reward=0.0, logs=[], metrics_detail=None)
+        return self._build_observation(reward=0.0, logs=[], metrics_detail=None, log_quality="full")
+
+    # ------------------------------------------------------------------
+    # _tick() — Real-time severity escalation (T2-8)
+    # ------------------------------------------------------------------
+
+    def _tick(self, step: int) -> None:
+        """
+        Escalate damage based on how long incident has been unaddressed.
+
+        Called at the START of each step before returning observation.
+        Implements 4 escalation tiers with progressive cascading damage.
+        """
+        # Count unhealthy services
+        degraded = []
+        critical = []
+        for name, svc in self._services.items():
+            if svc.status == ServiceStatusEnum.DEGRADED:
+                degraded.append(name)
+            elif svc.status == ServiceStatusEnum.DOWN:
+                critical.append(name)
+
+        # Determine escalation tier
+        if step <= 3:
+            self._escalation_tier = 1
+        elif step <= 7:
+            self._escalation_tier = 2
+        elif step <= 12:
+            self._escalation_tier = 3
+        else:
+            self._escalation_tier = 4
+
+        # Tier 2+: Root cause degrades further
+        if step > 3 and self._task:
+            root_svc = self._services.get(self._task.root_cause_service)
+            if root_svc and root_svc.status != ServiceStatusEnum.HEALTHY:
+                new_health_penalty = 0.04 if step > 5 else 0.02
+                # Degrade the root cause further — increase error rate, latency
+                current_err = root_svc.error_rate
+                new_err = min(1.0, current_err + new_health_penalty * 0.5)
+                current_lat = root_svc.latency_ms
+                new_lat = current_lat * 1.05  # 5% latency increase per step
+
+                updates = {"error_rate": round(new_err, 4), "latency_ms": round(new_lat, 1)}
+
+                # Tier 3+: Root cause may become critical if not already
+                if step > 8 and root_svc.status == ServiceStatusEnum.DEGRADED:
+                    if root_svc.error_rate > 0.6:
+                        updates["status"] = ServiceStatusEnum.DOWN
+
+                self._services[self._task.root_cause_service] = root_svc.model_copy(update=updates)
+
+        # Tier 3+: Direct dependents start degrading
+        if step > 7 and self._task:
+            root_name = self._task.root_cause_service
+            dependents = REVERSE_DEPS.get(root_name, [])
+            for dep_name in dependents:
+                dep_svc = self._services.get(dep_name)
+                if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
+                    self._services[dep_name] = dep_svc.model_copy(update={
+                        "status": ServiceStatusEnum.DEGRADED,
+                        "error_rate": max(dep_svc.error_rate, 0.15),
+                        "latency_ms": max(dep_svc.latency_ms, 500.0),
+                    })
+
+        # Tier 4: Full cascade — all unhealthy services worsen
+        if step > 12:
+            for name, svc in list(self._services.items()):
+                if svc.status != ServiceStatusEnum.HEALTHY:
+                    new_err = min(1.0, svc.error_rate + 0.03)
+                    self._services[name] = svc.model_copy(update={
+                        "error_rate": round(new_err, 4),
+                    })
+
+        # Determine services at risk (about to degrade next step)
+        self._services_at_risk = []
+        if self._task:
+            root_name = self._task.root_cause_service
+            # Direct dependents that are still healthy
+            for dep_name in REVERSE_DEPS.get(root_name, []):
+                dep_svc = self._services.get(dep_name)
+                if dep_svc and dep_svc.status == ServiceStatusEnum.HEALTHY:
+                    if step >= 6:  # they're about to degrade
+                        self._services_at_risk.append(dep_name)
+
+            # Second-order dependents at higher tiers
+            if step >= 10:
+                for dep_name in REVERSE_DEPS.get(root_name, []):
+                    for dep2_name in REVERSE_DEPS.get(dep_name, []):
+                        dep2_svc = self._services.get(dep2_name)
+                        if dep2_svc and dep2_svc.status == ServiceStatusEnum.HEALTHY:
+                            if dep2_name not in self._services_at_risk:
+                                self._services_at_risk.append(dep2_name)
 
     # ------------------------------------------------------------------
     # step()
@@ -170,10 +308,14 @@ class IncidentCommanderEnvironment:
                 reward=0.0,
                 logs=[],
                 metrics_detail=None,
+                log_quality="full",
             )
 
         self._state.step_count += 1
         self._last_action_error = None
+
+        # --- Severity escalation tick (T2-8) ---
+        self._tick(self._state.step_count)
 
         action_type = action.action_type.value
         service_name = action.service_name
@@ -196,7 +338,7 @@ class IncidentCommanderEnvironment:
             self._rewards.append(reward)
             self._state.cumulative_reward += reward
             self._state.actions_taken.append(action_str)
-            return self._build_observation(reward=reward, logs=[], metrics_detail=None)
+            return self._build_observation(reward=reward, logs=[], metrics_detail=None, log_quality="full")
 
         if needs_service and service_name not in ALL_SERVICES:
             self._last_action_error = (
@@ -208,16 +350,18 @@ class IncidentCommanderEnvironment:
             self._rewards.append(reward)
             self._state.cumulative_reward += reward
             self._state.actions_taken.append(action_str)
-            return self._build_observation(reward=reward, logs=[], metrics_detail=None)
+            return self._build_observation(reward=reward, logs=[], metrics_detail=None, log_quality="full")
 
         # Execute the action
         logs: List[str] = []
         metrics_detail = None
+        log_quality = "full"
 
         if action_type == "inspect_logs":
-            logs = generate_logs(
+            logs_result = generate_logs(
                 service_name, self._services, self._task.name, self._state.step_count
             )
+            logs, log_quality = logs_result
             self._inspected_services.add(service_name)
 
         elif action_type == "inspect_metrics":
@@ -251,10 +395,30 @@ class IncidentCommanderEnvironment:
             self._escalated = True
             self._is_done = True
 
+        elif action_type == "write_runbook":
+            # Agent writes runbook at end of episode (T2-7)
+            summary = action.metadata.get("summary", "") if action.metadata else ""
+            self._runbook_written = True
+            # Check if summary mentions the correct root cause
+            if self._task.root_cause_service.lower() in summary.lower():
+                self._runbook_correct = True
+
         elif action_type == "do_nothing":
             pass  # literally nothing
 
         self._actions_history.append(action_str)
+
+        # --- Check if first fix action matches runbook suggestion (T2-7) ---
+        if (
+            not self._runbook_used
+            and self._runbook_available
+            and action_type in ("restart_service", "scale_service", "rollback", "clear_cache")
+        ):
+            for suggestion in self._runbook_suggestions:
+                fix_seq = suggestion.get("fix_sequence", [])
+                if fix_seq and action_str == fix_seq[0]:
+                    self._runbook_used = True
+                    break
 
         # --- Chaos injection (before computing reward) ---
         self._last_chaos_event = None
@@ -294,6 +458,12 @@ class IncidentCommanderEnvironment:
         if self._state.step_count >= self._task.max_steps:
             self._is_done = True
 
+        # Time bounding: check SLA time limit (HTTP mode only) (T2-5)
+        elapsed = time.time() - self._episode_start_time if self._http_mode else 0.0
+        if self._http_mode and elapsed > self._task.time_limit_seconds and not self._is_done:
+            self._is_done = True
+            # Apply time-exceeded terminal penalty in reward below
+
         reward = compute_step_reward(
             prev_health=self._prev_health,
             curr_health=curr_health,
@@ -304,12 +474,27 @@ class IncidentCommanderEnvironment:
             services=self._services,
             is_done=self._is_done,
             steps_taken=self._state.step_count,
+            escalation_tier=self._escalation_tier,
+            runbook_used=self._runbook_used and action_type in ("restart_service", "scale_service", "rollback", "clear_cache"),
+            elapsed_seconds=elapsed - (self._last_step_time - self._episode_start_time) if self._http_mode else 0.0,
+            http_mode=self._http_mode,
         )
+
+        # Time-exceeded penalty (T2-5)
+        if self._http_mode and elapsed > self._task.time_limit_seconds:
+            reward -= 0.10
 
         # Chaos survival bonus: if agent handled chaos without further health loss
         health_delta = curr_health - self._prev_health
         if self._last_chaos_event and health_delta >= 0:
             reward += 0.05
+
+        # Runbook write reward (T2-7)
+        if action_type == "write_runbook":
+            if self._runbook_correct:
+                reward += 0.05
+            elif self._runbook_written:
+                reward += 0.02
 
         # Record timeline event
         event = {
@@ -318,6 +503,7 @@ class IncidentCommanderEnvironment:
             "health": round(curr_health, 4),
             "health_delta": round(health_delta, 4),
             "reward": round(reward, 4),
+            "escalation_tier": self._escalation_tier,
         }
         if self._last_chaos_event:
             event["chaos_event"] = self._last_chaos_event
@@ -332,6 +518,7 @@ class IncidentCommanderEnvironment:
         self._timeline.append(event)
 
         self._prev_health = curr_health
+        self._last_step_time = time.time()
         self._rewards.append(reward)
         self._state.cumulative_reward += reward
         self._state.actions_taken = list(self._actions_history)
@@ -340,9 +527,39 @@ class IncidentCommanderEnvironment:
         }
         self._state.incident_timeline = list(self._timeline)
 
+        # Auto-write runbook at episode end if agent didn't (T2-7)
+        if self._is_done and not self._runbook_written and self._task:
+            self._auto_write_runbook()
+
         return self._build_observation(
-            reward=reward, logs=logs, metrics_detail=metrics_detail
+            reward=reward, logs=logs, metrics_detail=metrics_detail, log_quality=log_quality
         )
+
+    # ------------------------------------------------------------------
+    # _auto_write_runbook() — auto-save episode result to memory (T2-7)
+    # ------------------------------------------------------------------
+
+    def _auto_write_runbook(self) -> None:
+        """Automatically save episode result to runbook memory at episode end."""
+        if not self._task or not self._state:
+            return
+
+        # Build fix sequence from recovery actions taken
+        fix_actions = [
+            a for a in self._actions_history
+            if not a.startswith("inspect_") and a != "do_nothing"
+            and a != "escalate" and a != "write_runbook"
+        ]
+
+        entry = RunbookEntry(
+            incident_type=self._incident_fingerprint,
+            root_cause_service=self._task.root_cause_service,
+            fix_sequence=fix_actions,
+            steps_taken=self._state.step_count,
+            score=self._state.cumulative_reward,
+            summary=f"Auto-recorded: {self._task.root_cause_description}",
+        )
+        self._runbook_memory.write(entry)
 
     # ------------------------------------------------------------------
     # state (property)
@@ -373,12 +590,17 @@ class IncidentCommanderEnvironment:
         if self._task is None:
             return {
                 "score": 0.0,
-                "breakdown": {"recovery": 0.0, "efficiency": 0.0, "diagnostics": 0.0, "ordering": 0.0},
+                "breakdown": {
+                    "recovery": 0.0, "efficiency": 0.0,
+                    "diagnostics": 0.0, "ordering": 0.0, "memory": 0.0,
+                },
                 "steps_taken": 0,
                 "is_resolved": False,
                 "escalated": False,
                 "rewards": [],
             }
+
+        elapsed = time.time() - self._episode_start_time if self._http_mode else 0.0
 
         score, breakdown = grade_episode(
             task=self._task,
@@ -387,6 +609,12 @@ class IncidentCommanderEnvironment:
             steps_taken=self._state.step_count if self._state else 0,
             is_resolved=self._state.is_resolved if self._state else False,
             escalated=self._escalated,
+            runbook_written=self._runbook_written,
+            runbook_correct=self._runbook_correct,
+            runbook_available=self._runbook_available,
+            runbook_used=self._runbook_used,
+            elapsed_seconds=elapsed,
+            http_mode=self._http_mode,
         )
         return {
             "score": score,
@@ -414,6 +642,7 @@ class IncidentCommanderEnvironment:
         reward: float,
         logs: List[str],
         metrics_detail: Optional[Dict[str, Any]],
+        log_quality: str = "full",
     ) -> IncidentObservation:
         """Construct an observation from current state."""
         health = compute_health_score(self._services)
@@ -428,10 +657,27 @@ class IncidentCommanderEnvironment:
             "resolved": SeverityLevel.RESOLVED,
         }
 
-        # Build metadata with optional chaos event info
+        # Build metadata with optional chaos event info and log quality
         obs_metadata: Dict[str, Any] = {}
         if self._last_chaos_event:
             obs_metadata["new_chaos_event"] = self._last_chaos_event
+        if log_quality != "full":
+            obs_metadata["log_quality"] = log_quality
+
+        # Time bounding info (T2-5)
+        if self._http_mode and self._task:
+            elapsed = time.time() - self._episode_start_time
+            remaining = max(0.0, self._task.time_limit_seconds - elapsed)
+            obs_metadata["elapsed_seconds"] = round(elapsed, 2)
+            obs_metadata["time_remaining"] = round(remaining, 2)
+            # Time pressure classification
+            pct_remaining = remaining / self._task.time_limit_seconds if self._task.time_limit_seconds > 0 else 0
+            if pct_remaining < 0.2:
+                obs_metadata["time_pressure"] = "critical"
+            elif pct_remaining < 0.5:
+                obs_metadata["time_pressure"] = "high"
+            else:
+                obs_metadata["time_pressure"] = "normal"
 
         return IncidentObservation(
             done=self._is_done,
@@ -447,4 +693,7 @@ class IncidentCommanderEnvironment:
             max_steps=self._task.max_steps if self._task else 30,
             last_action_error=self._last_action_error,
             task_name=self._task.name if self._task else "",
+            runbook_memory=self._runbook_suggestions,
+            escalation_tier=self._escalation_tier,
+            services_at_risk=self._services_at_risk,
         )

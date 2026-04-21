@@ -119,3 +119,59 @@ Every design decision made during development, who made it, and why.
 - Dry-run mode for local testing without GPU
 - Full training to be done in Bangalore with compute credits
 
+### D-30: Partial & Noisy Logs
+- File: server/services.py, server/models.py
+- `log_quality` field on ServiceState: `full | partial | empty | misleading`
+- Mapping: `oom → empty`, `cpu_spike → partial`, `bad_deploy → misleading`, `network_partition → partial`
+- `empty` returns "[LOG UNAVAILABLE — service not responding]"
+- `partial` drops 40-60% lines, truncates last entry
+- `misleading` generates logs blaming wrong service — forces cross-referencing metrics
+
+### D-31: Time Bounding / SLA Pressure
+- File: server/environment.py, server/tasks.py, server/grader.py
+- `time_limit_seconds` on TaskDefinition: Easy=120s, Medium=180s, Hard=300s, Expert=360s
+- HTTP mode only — direct Python usage keeps step-count-only for test compatibility
+- Observation fields: `elapsed_seconds`, `time_remaining`, `time_pressure` (critical/high/normal)
+- Time penalty: `-0.001 * elapsed` per step; `-0.10` terminal penalty on timeout
+- Efficiency grading blends 50/50 wall-clock + step-count in HTTP mode
+
+### D-32: Runbook Memory (Retrieval-Augmented RL)
+- File: server/runbook.py (NEW), server/environment.py, server/models.py, server/grader.py
+- `RunbookMemory` class: persistent across episodes, max 20 entries
+- `RunbookEntry` dataclass: incident_type fingerprint, fix_sequence, score, summary
+- Lookup by fingerprint similarity, top-3 results injected into observation
+- `write_runbook` action: +0.05 reward if summary contains correct root cause
+- Runbook use bonus: +0.08 if first fix matches runbook suggestion
+- Auto-writes episode result to memory at episode end
+
+### D-33: Real-Time Severity Escalation
+- File: server/environment.py
+- `_tick()` method called at start of each step
+- 4 escalation tiers: Steps 0-3 (stable), 4-7 (root degrades), 8-12 (dependents degrade), 13+ (cascade)
+- Progressive damage: error rates increase, services can transition from degraded → down
+- Observation fields: `escalation_tier` (1-4), `services_at_risk` (list)
+
+### D-34: Revenue-Loss-Grounded Reward
+- File: server/grader.py
+- Revenue loss per step by escalation tier: -0.005 (tier 1), -0.015 (tier 2), -0.030 (tier 3), -0.060 (tier 4)
+- Replaces flat time penalty with business-impact-grounded cost
+- Pitch: "Our reward function is grounded in real business cost"
+
+### D-35: Grader Weight Rebalance
+- File: server/grader.py, tests/test_edge_cases.py
+- Old: Recovery 40%, Efficiency 25%, Diagnostics 15%, Ordering 20%
+- New: Recovery 35%, Efficiency 20%, Diagnostics 15%, Ordering 20%, Memory 10%
+- Memory Utilization (10%): did agent leverage runbook data and contribute new knowledge?
+- Test threshold adjusted: test_expert_easy 0.90 → 0.80
+
+### D-36: WRITE_RUNBOOK Action Type
+- File: server/models.py
+- New ActionType enum value for `write_runbook`
+- Agent can call this to save incident learnings to runbook memory
+- Takes `summary` via action metadata
+
+### D-37: HTTP Mode Flag
+- File: server/environment.py, server/app.py
+- `http_mode: bool = False` on IncidentCommanderEnvironment constructor
+- FastAPI app passes `http_mode=True` — enables time bounding and SLA pressure
+- Direct Python usage (tests, inference scripts) defaults to `False` — no time pressure

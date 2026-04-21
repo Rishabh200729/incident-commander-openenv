@@ -28,6 +28,7 @@ class ActionType(str, Enum):
     CLEAR_CACHE = "clear_cache"
     ESCALATE = "escalate"
     DO_NOTHING = "do_nothing"
+    WRITE_RUNBOOK = "write_runbook"
 
 
 class ServiceStatusEnum(str, Enum):
@@ -106,6 +107,10 @@ class ServiceState(BaseModel):
     version: str = Field(
         default="v1.0.0", description="Currently deployed version"
     )
+    log_quality: str = Field(
+        default="full",
+        description="Log availability quality: full | partial | empty | misleading",
+    )
 
 
 class IncidentObservation(BaseModel):
@@ -166,6 +171,18 @@ class IncidentObservation(BaseModel):
     )
     task_name: str = Field(
         default="", description="Name of the current task"
+    )
+    runbook_memory: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Relevant past runbook entries for similar incidents",
+    )
+    escalation_tier: int = Field(
+        default=1, ge=1, le=4,
+        description="Current escalation tier (1=stable, 4=full cascade)",
+    )
+    services_at_risk: List[str] = Field(
+        default_factory=list,
+        description="Services about to degrade in the next step",
     )
 
 

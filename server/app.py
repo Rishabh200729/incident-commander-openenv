@@ -103,7 +103,7 @@ def create_incident_app() -> FastAPI:
     )
 
     # Single environment instance (stateful) with concurrency guard
-    env = IncidentCommanderEnvironment()
+    env = IncidentCommanderEnvironment(http_mode=True)
     _lock = asyncio.Lock()
     _is_initialised = False
 
