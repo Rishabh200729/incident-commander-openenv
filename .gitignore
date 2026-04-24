@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.venv310/
 
 # Distribution
 dist/
