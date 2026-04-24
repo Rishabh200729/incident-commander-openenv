@@ -31,6 +31,10 @@ outputs/
 logs/
 evals/
 
+# Training artifacts
+trained_model*/
+checkpoint-*/
+
 # Environment
 .env
 .env.local
