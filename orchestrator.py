@@ -113,6 +113,11 @@ def choose_heuristic_action(
     services: Dict[str, Dict[str, Any]] = obs_dict.get("services", {}) or {}
     inspected, restarted, scaled, rolled_back, cleared = _parse_history(action_history)
     ranked = _rank_services(services)
+    health = float(obs_dict.get("system_health_score", 0.0))
+
+    # --- Early exit: if system is already resolved, stop immediately ---
+    if health >= 0.95:
+        return IncidentAction(action_type=ActionType.DO_NOTHING)
 
     # --- Phase 0: chaos event awareness ---
     # If a new chaos event just fired, inspect that service immediately.
@@ -174,12 +179,15 @@ def choose_heuristic_action(
 
     # --- Phase C: dependency-ordered recovery ---
     # Restart unhealthy services in a fixed dependency order.
-    # Allow re-restart if chaos/escalation knocked a service back to DOWN.
+    # Allow re-restart if chaos/escalation knocked a service back to DOWN,
+    # or if a prior restart didn't fix a degraded service (deps still broken).
     for name in DEP_ORDER:
         svc = services.get(name, {})
-        if _service_is_unhealthy(svc):
-            if name not in restarted or svc.get("status") == "down":
-                return IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name=name)
+        if svc.get("status") == "down":
+            # DOWN always gets restarted, even if tried before (chaos may have re-broken)
+            return IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name=name)
+        if svc.get("status") == "degraded" and name not in restarted:
+            return IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name=name)
 
     return IncidentAction(action_type=ActionType.DO_NOTHING)
 
@@ -249,6 +257,11 @@ def should_override_model_action(
         if _service_is_unhealthy(auth) and model_action.service_name in ("payments", "checkout"):
             if "auth" not in restarted and "auth" not in rolled_back:
                 return True, "auth_unhealthy_fix_upstream_first"
+
+    # Don't override when system is nearly resolved — let the model finish.
+    health = float(obs_dict.get("system_health_score", 0.0))
+    if health >= 0.90:
+        return False, "near_resolved"
 
     return False, "ok"
 
