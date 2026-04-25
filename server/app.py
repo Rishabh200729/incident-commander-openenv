@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Request / Response models for the HTTP layer
 # ---------------------------------------------------------------------------
 
+
 class ResetRequest(BaseModel):
     seed: Optional[int] = None
     episode_id: Optional[str] = None
@@ -80,6 +81,7 @@ class TaskListResponse(BaseModel):
 # App factory
 # ---------------------------------------------------------------------------
 
+
 def create_incident_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -106,6 +108,7 @@ def create_incident_app() -> FastAPI:
     env = IncidentCommanderEnvironment(http_mode=True)
     _lock = asyncio.Lock()
     _is_initialised = False
+    _last_observation: Optional[IncidentObservation] = None
 
     # ---- Health check ----
     @app.get("/health", response_model=HealthResponse)
@@ -120,7 +123,7 @@ def create_incident_app() -> FastAPI:
     # ---- Reset ----
     @app.post("/reset", response_model=ResetResponse)
     async def reset(request: ResetRequest = None):
-        nonlocal _is_initialised
+        nonlocal _is_initialised, _last_observation
         req = request or ResetRequest()
         async with _lock:
             try:
@@ -131,6 +134,7 @@ def create_incident_app() -> FastAPI:
                     chaos_mode=req.chaos_mode,
                 )
                 _is_initialised = True
+                _last_observation = obs
                 obs_dict = obs.model_dump()
                 return ResetResponse(
                     observation=obs_dict,
@@ -146,6 +150,7 @@ def create_incident_app() -> FastAPI:
     # ---- Step ----
     @app.post("/step", response_model=StepResponse)
     async def step(request: StepRequest):
+        nonlocal _last_observation
         if not _is_initialised:
             raise HTTPException(
                 status_code=400,
@@ -162,6 +167,7 @@ def create_incident_app() -> FastAPI:
         async with _lock:
             try:
                 obs = env.step(action)
+                _last_observation = obs
                 obs_dict = obs.model_dump()
                 return StepResponse(
                     observation=obs_dict,
@@ -202,6 +208,7 @@ def create_incident_app() -> FastAPI:
         """Return environment metadata and capabilities."""
         from .services import DEPENDENCY_GRAPH, ALL_SERVICES
         from .tasks import list_tasks as _list_tasks, get_task
+
         tasks_info = {}
         for t_name in _list_tasks():
             t = get_task(t_name)
@@ -216,25 +223,39 @@ def create_incident_app() -> FastAPI:
             "services": ALL_SERVICES,
             "dependency_graph": DEPENDENCY_GRAPH,
             "action_types": [
-                "inspect_logs", "inspect_metrics",
-                "restart_service", "scale_service",
-                "rollback", "clear_cache",
-                "escalate", "do_nothing",
+                "inspect_logs",
+                "inspect_metrics",
+                "restart_service",
+                "scale_service",
+                "rollback",
+                "clear_cache",
+                "escalate",
+                "do_nothing",
             ],
             "tasks": tasks_info,
         }
+
     # ---- Live Health Dashboard (T2-3) ----
     @app.get("/dashboard")
     async def dashboard():
         """Live auto-refreshing HTML dashboard for demo presentations."""
         from fastapi.responses import HTMLResponse
+
         state = env.state
         services = state.services
         from .services import compute_health_score
+
         health = compute_health_score(services) if services else 0.0
 
         rows = ""
-        for name in ["database", "cache", "auth", "notification", "payments", "checkout"]:
+        for name in [
+            "database",
+            "cache",
+            "auth",
+            "notification",
+            "payments",
+            "checkout",
+        ]:
             svc = services.get(name)
             if svc is None:
                 continue
@@ -260,7 +281,7 @@ def create_incident_app() -> FastAPI:
                     {status.upper()}
                 </td>
                 <td>{health_pct:.0f}%</td>
-                <td>{svc.error_rate*100:.1f}%</td>
+                <td>{svc.error_rate * 100:.1f}%</td>
                 <td>{svc.latency_ms:.0f} ms</td>
                 <td>{svc.cpu_percent:.0f}%</td>
                 <td>{svc.instances}</td>
@@ -287,7 +308,7 @@ def create_incident_app() -> FastAPI:
         <body>
             <h1>🚨 Incident Commander</h1>
             <div class="meta">
-                Task: <b>{state.task_name or 'N/A'}</b> &nbsp;|&nbsp;
+                Task: <b>{state.task_name or "N/A"}</b> &nbsp;|&nbsp;
                 Step: <b>{state.step_count}</b> &nbsp;|&nbsp;
                 Score: <b>{state.cumulative_reward:.3f}</b> &nbsp;|&nbsp;
                 Resolved: <b>{state.is_resolved}</b>
@@ -295,7 +316,7 @@ def create_incident_app() -> FastAPI:
             <div style="margin-bottom:12px;">
                 System Health: <b>{health:.1%}</b>
                 <div class="health-bar">
-                    <div class="health-fill" style="width:{health*100:.0f}%; background: {'#22c55e' if health > 0.8 else '#eab308' if health > 0.5 else '#ef4444'};"></div>
+                    <div class="health-fill" style="width:{health * 100:.0f}%; background: {"#22c55e" if health > 0.8 else "#eab308" if health > 0.5 else "#ef4444"};"></div>
                 </div>
             </div>
             <table>
@@ -339,8 +360,12 @@ def create_incident_app() -> FastAPI:
     _model_state = {"model": None, "tokenizer": None, "loaded": False, "error": None}
 
     class PredictRequest(BaseModel):
-        base_model: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct", description="Base model name")
-        adapter_path: str = Field(default="trained_model_full_0p5b", description="LoRA adapter path")
+        base_model: str = Field(
+            default="Qwen/Qwen2.5-0.5B-Instruct", description="Base model name"
+        )
+        adapter_path: str = Field(
+            default="trained_model_full_0p5b", description="LoRA adapter path"
+        )
         device: str = Field(default="auto", description="Device: auto, cpu, cuda, mps")
 
     @app.post("/predict")
@@ -354,6 +379,7 @@ def create_incident_app() -> FastAPI:
         The model is lazy-loaded on first call to avoid slowing down server startup.
         """
         import os, sys
+
         req = request or PredictRequest()
 
         # Lazy-load model
@@ -367,32 +393,41 @@ def create_incident_app() -> FastAPI:
                 if device == "auto":
                     if torch.cuda.is_available():
                         device = "cuda"
-                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    elif (
+                        hasattr(torch.backends, "mps")
+                        and torch.backends.mps.is_available()
+                    ):
                         device = "mps"
                     else:
                         device = "cpu"
 
                 from pathlib import Path
+
                 adapter_dir = Path(req.adapter_path)
                 if not adapter_dir.exists():
                     raise HTTPException(
                         status_code=404,
                         detail=f"Adapter not found at '{req.adapter_path}'. "
-                               f"Get trained_model_full_0p5b/ from your teammate.",
+                        f"Get trained_model_full_0p5b/ from your teammate.",
                     )
 
                 dtype = torch.float32
                 if device == "mps":
                     dtype = torch.float16
                 elif device == "cuda":
-                    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                    dtype = (
+                        torch.bfloat16
+                        if torch.cuda.is_bf16_supported()
+                        else torch.float16
+                    )
 
                 tokenizer = AutoTokenizer.from_pretrained(req.base_model)
                 if tokenizer.pad_token is None:
                     tokenizer.pad_token = tokenizer.eos_token
 
                 base = AutoModelForCausalLM.from_pretrained(
-                    req.base_model, torch_dtype=dtype,
+                    req.base_model,
+                    torch_dtype=dtype,
                     device_map=device if device != "mps" else None,
                 )
                 if device == "mps":
@@ -410,7 +445,9 @@ def create_incident_app() -> FastAPI:
                 raise
             except Exception as e:
                 _model_state["error"] = str(e)
-                raise HTTPException(status_code=500, detail=f"Model loading failed: {e}")
+                raise HTTPException(
+                    status_code=500, detail=f"Model loading failed: {e}"
+                )
 
         model = _model_state["model"]
         tokenizer = _model_state["tokenizer"]
@@ -420,7 +457,9 @@ def create_incident_app() -> FastAPI:
 
         # Build prompt from current env state using EXACT training format
         try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            sys.path.insert(
+                0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
             from train_grpo import build_obs_prompt
         except ImportError:
             raise HTTPException(
@@ -431,23 +470,16 @@ def create_incident_app() -> FastAPI:
         import torch
 
         state = env.state
-        obs_dict = {
-            "services": {k: v.model_dump() for k, v in state.services.items()},
-            "system_health_score": sum(
-                1 for s in state.services.values()
-                if s.status.value == "healthy"
-            ) / max(len(state.services), 1),
-            "max_steps": 30,
-            "incident_severity": "unknown",
-            "alerts": [],
-            "logs": [],
-            "escalation_tier": 1,
-            "services_at_risk": [],
-            "runbook_memory": [],
-            "metadata": {},
-        }
+        if _last_observation is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No observation available. Call POST /reset first.",
+            )
+        obs_dict = _last_observation.model_dump()
 
-        prompt_text = build_obs_prompt(obs_dict, state.step_count + 1, state.actions_taken)
+        prompt_text = build_obs_prompt(
+            obs_dict, state.step_count + 1, state.actions_taken
+        )
         messages = [{"role": "user", "content": prompt_text}]
 
         if hasattr(tokenizer, "apply_chat_template"):
@@ -457,7 +489,9 @@ def create_incident_app() -> FastAPI:
         else:
             input_text = prompt_text
 
-        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = tokenizer(
+            input_text, return_tensors="pt", truncation=True, max_length=2048
+        )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         with torch.no_grad():
@@ -471,14 +505,17 @@ def create_incident_app() -> FastAPI:
                 pad_token_id=tokenizer.pad_token_id,
             )
 
-        generated = outputs[0][inputs["input_ids"].shape[1]:]
+        generated = outputs[0][inputs["input_ids"].shape[1] :]
         response = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
         # Parse JSON action using the shared fuzzy parser
         action_data = None
         try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            sys.path.insert(
+                0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
             from evaluate_trained import parse_action as fuzzy_parse
+
             parsed = fuzzy_parse(response)
             if parsed:
                 action_data = {"action_type": parsed.action_type.value}
@@ -487,6 +524,7 @@ def create_incident_app() -> FastAPI:
         except ImportError:
             # Fallback: basic JSON extraction
             import json as json_mod
+
             try:
                 action_data = json_mod.loads(response)
             except Exception:
@@ -495,7 +533,7 @@ def create_incident_app() -> FastAPI:
                     end = response.rfind("}")
                     if end > idx:
                         try:
-                            action_data = json_mod.loads(response[idx:end+1])
+                            action_data = json_mod.loads(response[idx : end + 1])
                         except Exception:
                             pass
 
@@ -509,10 +547,13 @@ def create_incident_app() -> FastAPI:
             if len(recent) == 3 and all(a == a_check for a in recent):
                 # Fall back to smart heuristic
                 from inference import fallback_action
+
                 obs_for_fallback = {
                     "services": {k: v.model_dump() for k, v in state.services.items()},
                 }
-                fb = fallback_action(obs_for_fallback, state.step_count + 1, state.actions_taken)
+                fb = fallback_action(
+                    obs_for_fallback, state.step_count + 1, state.actions_taken
+                )
                 action_data = {"action_type": fb.action_type.value}
                 if fb.service_name:
                     action_data["service_name"] = fb.service_name
@@ -547,6 +588,7 @@ app = create_incident_app()
 def main():
     """Entry point for direct execution."""
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
