@@ -56,9 +56,11 @@ sft_warmstart_adapter/
 sft_merged_model/
 
 meow.txt
+meow2.txt
 trained_model_v2/
 sft_merged_model_final/
 sft_warmstart_adapter_final/
 evaluation_results.json
+evaluation_results2.json
 training_log.json
 sft_dataset.json
