@@ -35,6 +35,9 @@ results/
 trained_model*/
 checkpoint-*/
 
+sft_warmstart_adapter_final/
+sft_merged_model_final/
+
 # Environment
 .env
 .env.local
@@ -53,3 +56,4 @@ sft_warmstart_adapter/
 sft_merged_model/
 
 meow.txt
+.pytest_cache/
