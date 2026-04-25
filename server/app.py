@@ -564,6 +564,39 @@ def create_incident_app() -> FastAPI:
             "model_device": str(next(model.parameters()).device),
         }
 
+    @app.post("/predict_and_step")
+    async def predict_and_step(request: PredictRequest = None):
+        """
+        One-shot endpoint: predict the next action AND execute it.
+
+        This is the endpoint the frontend should call in a loop until done=true.
+        Combines /predict + /step atomically so the caller doesn't need to
+        make two separate requests per step.
+        """
+        nonlocal _last_observation
+
+        # 1. Get the predicted action (reuses /predict logic)
+        predict_result = await predict(request)
+        action_data = predict_result["parsed_action"]
+
+        # 2. Execute the action on the environment
+        action = IncidentAction(**action_data)
+        async with _lock:
+            obs = env.step(action)
+            _last_observation = obs
+
+        obs_dict = obs.model_dump()
+        return {
+            "action_taken": action_data,
+            "routing": predict_result["routing"],
+            "observation": obs_dict,
+            "reward": obs.reward,
+            "done": obs.done,
+            "step": env.state.step_count,
+            "system_health": obs_dict.get("system_health_score", 0.0),
+            "is_resolved": env.state.is_resolved,
+        }
+
     @app.get("/model/info")
     async def model_info():
         """Return trained model status and metadata."""

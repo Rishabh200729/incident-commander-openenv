@@ -105,18 +105,8 @@ def run_live_task(
                         error_str = f"predict_error:{str(e).replace(chr(10), ' ')}"
 
             if action is not None:
-                a_check = action.action_type.value
-                if action.service_name:
-                    a_check += f":{action.service_name}"
-                recent = (
-                    action_history[-max_repeats:]
-                    if len(action_history) >= max_repeats
-                    else []
-                )
-                if len(recent) == max_repeats and all(a == a_check for a in recent):
-                    action = heuristic_action(obs_dict, action_history)
-
-            if action is None:
+                pass  # Orchestrator in /predict already handles repeat detection
+            else:
                 action = heuristic_action(obs_dict, action_history)
 
             action_str = action.action_type.value
