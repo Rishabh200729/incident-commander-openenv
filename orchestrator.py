@@ -61,6 +61,24 @@ def _service_is_unhealthy(svc: Dict[str, Any]) -> bool:
     return svc.get("status") in ("down", "degraded")
 
 
+def _infer_root_cause(services: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """Infer the most likely root cause from observations alone (no answer key)."""
+    # 1. Version mismatch = definite root cause (bad deploy)
+    for name, svc in services.items():
+        if svc.get("version", "v1.0.0") != "v1.0.0":
+            return name
+    # 2. DOWN with instances=0 = OOM crash root cause
+    for name, svc in services.items():
+        if svc.get("status") == "down" and int(svc.get("instances", 1) or 0) == 0:
+            return name
+    # 3. Upstream services are more likely root causes
+    for name in DEP_ORDER:
+        svc = services.get(name, {})
+        if svc.get("status") in ("down", "degraded"):
+            return name
+    return None
+
+
 def _rank_services(services: Dict[str, Dict[str, Any]]) -> List[Tuple[float, str, Dict[str, Any]]]:
     ranked: List[Tuple[float, str, Dict[str, Any]]] = []
     for name, svc in services.items():
@@ -89,17 +107,24 @@ def choose_heuristic_action(
     """
     Task-aware deterministic policy.
 
-    Guarantees early diagnostics (incl. true root cause service) then applies
+    Guarantees early diagnostics (incl. inferred root cause) then applies
     high-value pattern fixes and dependency-ordered restarts.
     """
     services: Dict[str, Dict[str, Any]] = obs_dict.get("services", {}) or {}
     inspected, restarted, scaled, rolled_back, cleared = _parse_history(action_history)
     ranked = _rank_services(services)
 
+    # --- Phase 0: chaos event awareness ---
+    # If a new chaos event just fired, inspect that service immediately.
+    chaos_event = obs_dict.get("metadata", {}).get("new_chaos_event")
+    if chaos_event and chaos_event not in inspected:
+        return IncidentAction(action_type=ActionType.INSPECT_LOGS, service_name=chaos_event)
+
     # --- Phase A: diagnostics guard (first ~3 steps) ---
-    # Ensure we inspect the *true* root cause service early for diagnostics credit.
-    if step <= 3 and task.root_cause_service and task.root_cause_service not in inspected:
-        return IncidentAction(action_type=ActionType.INSPECT_LOGS, service_name=task.root_cause_service)
+    # Infer root cause from observations (no answer key).
+    inferred_root = _infer_root_cause(services)
+    if step <= 3 and inferred_root and inferred_root not in inspected:
+        return IncidentAction(action_type=ActionType.INSPECT_LOGS, service_name=inferred_root)
 
     # Ensure we inspect at least 2 distinct unhealthy services early (diagnostics component maxes at 0.15).
     if step <= 3 and len(inspected) < 2:
@@ -127,9 +152,10 @@ def choose_heuristic_action(
         if name not in rolled_back:
             return IncidentAction(action_type=ActionType.ROLLBACK, service_name=name)
 
-    # 2) CPU spike: scale before restart (database tasks).
+    # 2) CPU spike: scale before restart — ONLY when degraded (alive but overloaded).
+    #    DOWN services have stale CPU metrics; they need restart, not scale.
     db = services.get("database", {})
-    if db and _service_is_unhealthy(db) and float(db.get("cpu_percent", 0.0) or 0.0) >= 90.0:
+    if db and db.get("status") == "degraded" and float(db.get("cpu_percent", 0.0) or 0.0) >= 90.0:
         if "database" not in scaled:
             return IncidentAction(action_type=ActionType.SCALE_SERVICE, service_name="database")
         if "database" not in restarted:
@@ -148,10 +174,12 @@ def choose_heuristic_action(
 
     # --- Phase C: dependency-ordered recovery ---
     # Restart unhealthy services in a fixed dependency order.
+    # Allow re-restart if chaos/escalation knocked a service back to DOWN.
     for name in DEP_ORDER:
         svc = services.get(name, {})
-        if _service_is_unhealthy(svc) and name not in restarted:
-            return IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name=name)
+        if _service_is_unhealthy(svc):
+            if name not in restarted or svc.get("status") == "down":
+                return IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name=name)
 
     return IncidentAction(action_type=ActionType.DO_NOTHING)
 
@@ -174,8 +202,9 @@ def should_override_model_action(
     if _is_repeating(action_history, candidate, repeat_n=repeat_n):
         return True, f"repeat×{repeat_n}"
 
-    # Diagnostics guard: don't allow early recovery actions before inspecting the true root cause.
-    if step <= 3 and task.root_cause_service and task.root_cause_service not in inspected:
+    # Diagnostics guard: don't allow early recovery actions before inspecting the inferred root cause.
+    inferred_root = _infer_root_cause(services)
+    if step <= 3 and inferred_root and inferred_root not in inspected:
         if model_action.action_type not in (ActionType.INSPECT_LOGS, ActionType.INSPECT_METRICS):
             return True, "early_recovery_before_root_inspect"
 
@@ -201,21 +230,25 @@ def should_override_model_action(
             if model_action.action_type == ActionType.RESTART_SERVICE and model_action.service_name in ("payments", "checkout"):
                 return True, "must_clear_cache_after_auth_rollback"
 
-    # Database CPU spike guardrail: scale before restart.
+    # Database CPU spike guardrail: scale before restart — ONLY when degraded.
+    # DOWN services have stale CPU metrics; restart is correct for DOWN.
     db = services.get("database", {}) or {}
-    if db and _service_is_unhealthy(db) and float(db.get("cpu_percent", 0.0) or 0.0) >= 90.0:
-        if model_action.action_type == ActionType.RESTART_SERVICE and model_action.service_name == "database":
+    if db and db.get("status") == "degraded" and float(db.get("cpu_percent", 0.0) or 0.0) >= 90.0:
+        if model_action.action_type in (ActionType.RESTART_SERVICE, ActionType.ROLLBACK) and model_action.service_name == "database":
             if "database" not in scaled:
                 return True, "db_high_cpu_requires_scale_first"
 
     # Dependency ordering guardrail (fix upstream before dependents) for recovery actions.
+    # Only block if we haven't already attempted to fix the upstream service.
     if model_action.action_type in (ActionType.RESTART_SERVICE, ActionType.SCALE_SERVICE, ActionType.ROLLBACK):
-        # If database unhealthy, don't restart auth/payments/checkout first.
+        # If database unhealthy AND we haven't tried fixing it yet, don't fix dependents first.
         if _service_is_unhealthy(db) and model_action.service_name in ("auth", "payments", "checkout"):
-            return True, "db_unhealthy_fix_upstream_first"
-        # If auth unhealthy, don't restart payments/checkout first.
+            if "database" not in restarted and "database" not in scaled:
+                return True, "db_unhealthy_fix_upstream_first"
+        # If auth unhealthy AND we haven't tried fixing it yet, don't fix dependents first.
         if _service_is_unhealthy(auth) and model_action.service_name in ("payments", "checkout"):
-            return True, "auth_unhealthy_fix_upstream_first"
+            if "auth" not in restarted and "auth" not in rolled_back:
+                return True, "auth_unhealthy_fix_upstream_first"
 
     return False, "ok"
 
