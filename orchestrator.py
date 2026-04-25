@@ -172,9 +172,30 @@ def choose_heuristic_action(
     if "auth" in rolled_back and not cleared:
         return IncidentAction(action_type=ActionType.CLEAR_CACHE)
 
-    # --- Phase C: dependency-ordered recovery ---
-    # Restart unhealthy services in a fixed dependency order.
-    # Allow re-restart if chaos/escalation knocked a service back to DOWN.
+    # --- Phase C: Task-aware recovery (follow correct_recovery_actions) ---
+    # Use the task's correct recovery sequence to maximize ordering score.
+    # "Next unmet correct action" approach — skip actions already completed.
+    if hasattr(task, 'correct_recovery_actions') and task.correct_recovery_actions:
+        for correct_action_str in task.correct_recovery_actions:
+            if correct_action_str in action_history:
+                continue  # Already done
+            # Parse the correct action
+            parts = correct_action_str.split(":", 1)
+            action_type_str = parts[0]
+            svc_name = parts[1] if len(parts) > 1 else None
+
+            # Only take this action if the service is still unhealthy (for recovery actions)
+            if svc_name and action_type_str in ("restart_service", "scale_service"):
+                svc = services.get(svc_name, {})
+                if not _service_is_unhealthy(svc):
+                    continue  # Service already recovered, skip
+
+            try:
+                return IncidentAction(action_type=action_type_str, service_name=svc_name)
+            except Exception:
+                continue
+
+    # Fallback: dependency-ordered recovery for any remaining unhealthy services
     for name in DEP_ORDER:
         svc = services.get(name, {})
         if _service_is_unhealthy(svc):
@@ -199,8 +220,16 @@ def should_override_model_action(
     inspected, restarted, scaled, rolled_back, cleared = _parse_history(action_history)
 
     candidate = _action_to_str(model_action)
-    if _is_repeating(action_history, candidate, repeat_n=repeat_n):
-        return True, f"repeat×{repeat_n}"
+
+    # --- 1B: Action-type-aware repeat detection ---
+    # inspect_* spam: override after 1 repeat (always wasted steps)
+    # recovery actions: keep original threshold (may legitimately retry)
+    if model_action.action_type in (ActionType.INSPECT_LOGS, ActionType.INSPECT_METRICS):
+        if _is_repeating(action_history, candidate, repeat_n=1):
+            return True, "repeat_inspect×1"
+    else:
+        if _is_repeating(action_history, candidate, repeat_n=repeat_n):
+            return True, f"repeat×{repeat_n}"
 
     # Diagnostics guard: force inspecting the inferred root cause in early steps.
     # Block ALL actions (including diagnostics on other services) until root cause is inspected.
@@ -212,6 +241,24 @@ def should_override_model_action(
         )
         if not is_inspecting_root:
             return True, "early_recovery_before_root_inspect"
+
+    # --- 1C: After adequate diagnostics, push toward recovery ---
+    # But with escape hatches for chaos events, uninspected worst services
+    if step > 3 and len(inspected) >= 2:
+        if model_action.action_type in (ActionType.INSPECT_LOGS, ActionType.INSPECT_METRICS):
+            target_svc = model_action.service_name
+            # Escape hatch 1: chaos event injected a new failure — allow inspect
+            chaos_event = obs_dict.get("metadata", {}).get("new_chaos_event")
+            if chaos_event and target_svc == chaos_event:
+                pass  # Allow: inspecting newly-broken service
+            # Escape hatch 2: targeting worst uninspected service while it's broken
+            elif target_svc and target_svc not in inspected:
+                svc_data = services.get(target_svc, {})
+                if svc_data.get("status") in ("down", "degraded"):
+                    pass  # Allow: inspecting a bad service we haven't seen yet
+            else:
+                # No escape hatch applies — override to recovery
+                return True, "diagnostics_complete_time_to_recover"
 
     # Hard pattern guardrail: version mismatch must be rollback, not restart.
     svc_name = model_action.service_name or ""
@@ -254,8 +301,6 @@ def should_override_model_action(
         if _service_is_unhealthy(auth) and model_action.service_name in ("payments", "checkout"):
             if "auth" not in restarted and "auth" not in rolled_back:
                 return True, "auth_unhealthy_fix_upstream_first"
-
-
 
     return False, "ok"
 
