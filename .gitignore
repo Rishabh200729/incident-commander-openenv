@@ -61,13 +61,15 @@ sft_warmstart_adapter/
 sft_merged_model/
 
 meow.txt
+meow2.txt
 trained_model_v2/
 sft_merged_model_final/
 sft_warmstart_adapter_final/
 evaluation_results.json
+evaluation_results2.json
 training_log.json
 sft_dataset.json
-
 # Frontend build/deps
 frontend_app/node_modules/
 frontend_app/.next/
+grpo_training_logs.txt
