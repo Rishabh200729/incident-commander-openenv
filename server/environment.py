@@ -393,12 +393,26 @@ class IncidentCommanderEnvironment:
             self._is_done = True
 
         elif action_type == "write_runbook":
-            # Agent writes runbook — only meaningful at episode end (Audit Fix #7)
-            if self._is_done or self._state.step_count >= self._task.max_steps - 1:
+            # Agent writes runbook — allow when: episode done, near step limit,
+            # OR system is already fully healthy (resolved but _is_done not set yet)
+            curr_health_pre = compute_health_score(self._services)
+            all_healthy_pre = all(
+                s.status == ServiceStatusEnum.HEALTHY for s in self._services.values()
+            )
+            allowed = (
+                self._is_done
+                or self._state.step_count >= self._task.max_steps - 1
+                or (all_healthy_pre and curr_health_pre >= 0.95)
+            )
+            if allowed:
                 summary = action.metadata.get("summary", "") if action.metadata else ""
                 self._runbook_written = True
                 if self._task.root_cause_service.lower() in summary.lower():
                     self._runbook_correct = True
+                # Treat write_runbook as terminal when system is already resolved
+                if all_healthy_pre and curr_health_pre >= 0.95:
+                    self._state.is_resolved = True
+                    self._is_done = True
             else:
                 self._last_action_error = "write_runbook only allowed on final step or after resolution"
 
