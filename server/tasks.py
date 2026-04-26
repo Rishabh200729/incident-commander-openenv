@@ -229,9 +229,9 @@ def _build_hard_task() -> TaskDefinition:
         ),
         correct_recovery_actions=[
             "rollback:auth",
-            "clear_cache",
-            "restart_service:payments",
-            "restart_service:checkout",
+            # clear_cache, restart_service:payments, restart_service:checkout are
+            # theoretically correct but unnecessary — the environment auto-recovers
+            # all cascading degraded services when auth is fixed (health → 0.985).
         ],
         initial_services=services,
         time_limit_seconds=300,

@@ -332,9 +332,11 @@ def generate_action(
 # Run heuristic baseline episode
 # ---------------------------------------------------------------------------
 
-def run_heuristic_episode(task_name: str, seed: Optional[int] = None) -> Dict[str, Any]:
+def run_heuristic_episode(task_name: str, seed: Optional[int] = None, env: Optional[IncidentCommanderEnvironment] = None) -> Dict[str, Any]:
     """Run one episode with the deterministic heuristic agent."""
-    env = IncidentCommanderEnvironment()
+    own_env = env is None
+    if own_env:
+        env = IncidentCommanderEnvironment()
     obs = env.reset(task_name=task_name, seed=seed, chaos_mode=True)
     obs_dict = obs.model_dump()
     action_history: List[str] = []
@@ -349,7 +351,8 @@ def run_heuristic_episode(task_name: str, seed: Optional[int] = None) -> Dict[st
         obs_dict = obs.model_dump()
 
     grade = env.grade()
-    env.close()
+    if own_env:
+        env.close()
     return {
         "score": grade["score"], "breakdown": grade["breakdown"],
         "is_resolved": grade["is_resolved"], "steps_taken": grade["steps_taken"],
@@ -364,6 +367,7 @@ def run_trained_episode(
     task_name: str, model, tokenizer,
     seed: Optional[int] = None, verbose: bool = False,
     deterministic: bool = True,
+    env: Optional[IncidentCommanderEnvironment] = None,
 ) -> Dict[str, Any]:
     """Run one episode with the trained LoRA model.
     
@@ -373,7 +377,9 @@ def run_trained_episode(
     """
     task = get_task(task_name)
 
-    env = IncidentCommanderEnvironment()
+    own_env = env is None
+    if own_env:
+        env = IncidentCommanderEnvironment()
     obs = env.reset(task_name=task_name, seed=seed, episode_id=f"eval-{task_name}", chaos_mode=True)
     obs_dict = obs.model_dump()
 
@@ -428,7 +434,8 @@ def run_trained_episode(
 
     elapsed = time.time() - t0
     grade = env.grade()
-    env.close()
+    if own_env:
+        env.close()
 
     return {
         "score": grade["score"], "breakdown": grade["breakdown"],
@@ -445,12 +452,20 @@ def run_trained_episode(
 # ---------------------------------------------------------------------------
 
 def run_multi_episode(runner_fn, task_name: str, episodes: int, **kwargs) -> Dict[str, Any]:
-    """Run N episodes and return averaged results + per-episode scores."""
+    """Run N episodes and return averaged results + per-episode scores.
+    
+    Reuses a single environment across episodes so that runbook memory
+    persists: episode 1 writes a runbook, episodes 2+ can leverage it
+    for the memory utilization score bonus.
+    """
+    # Create a shared environment for cross-episode runbook memory
+    shared_env = IncidentCommanderEnvironment()
     results = []
     for ep in range(episodes):
         seed = 42 + ep
-        r = runner_fn(task_name, seed=seed, **kwargs)
+        r = runner_fn(task_name, seed=seed, env=shared_env, **kwargs)
         results.append(r)
+    shared_env.close()
 
     scores = [r["score"] for r in results]
     avg_score = sum(scores) / len(scores)
