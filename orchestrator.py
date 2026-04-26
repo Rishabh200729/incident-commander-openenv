@@ -301,6 +301,23 @@ def should_override_model_action(
             if "auth" not in restarted and "auth" not in rolled_back:
                 return True, "auth_unhealthy_fix_upstream_first"
 
+    # --- Ordering guard: enforce correct_recovery_actions sequence ---
+    # If the model proposes an action that's in correct_recovery_actions but
+    # earlier actions in the sequence haven't been done yet, override so the
+    # heuristic (Phase C) can emit actions in the right order.
+    if hasattr(task, 'correct_recovery_actions') and task.correct_recovery_actions:
+        # Find the next undone correct action
+        next_correct = None
+        for cra in task.correct_recovery_actions:
+            if cra not in action_history:
+                next_correct = cra
+                break
+        if next_correct and candidate != next_correct:
+            # Model is proposing something other than the next correct action.
+            # Only override if the model's action IS a recovery action (not diagnostics).
+            if model_action.action_type not in (ActionType.INSPECT_LOGS, ActionType.INSPECT_METRICS, ActionType.DO_NOTHING):
+                return True, "ordering_sequence_enforcement"
+
     return False, "ok"
 
 
