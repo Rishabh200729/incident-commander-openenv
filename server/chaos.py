@@ -9,7 +9,7 @@ cascades where new problems emerge while you're fixing existing ones.
 from __future__ import annotations
 
 import random
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 from .models import ServiceState, ServiceStatusEnum
 
@@ -51,8 +51,8 @@ class ChaosAgent:
 
     def __init__(
         self,
-        injection_probability: float = 0.15,
-        min_step: int = 5,
+        injection_probability: float = 0.30,
+        min_step: int = 3,
     ) -> None:
         """
         Args:
@@ -63,6 +63,35 @@ class ChaosAgent:
         self.injection_probability = injection_probability
         self.min_step = min_step
         self._injected_services: Set[str] = set()
+
+    def _pick_target_and_profile(
+        self,
+        current_services: Dict[str, ServiceState],
+        rng: random.Random,
+        inspected_services: Optional[Set[str]] = None,
+    ) -> Optional[Tuple[str, Dict]]:
+        inspected = inspected_services or set()
+
+        candidates = []
+        preferred = []
+        for name, svc in current_services.items():
+            if (
+                svc.status == ServiceStatusEnum.HEALTHY
+                and name not in self._injected_services
+            ):
+                candidates.append(name)
+                if name not in inspected:
+                    preferred.append(name)
+
+        if not candidates:
+            return None
+
+        target_pool = preferred if preferred else candidates
+        target = rng.choice(target_pool)
+
+        profile_name = rng.choice(list(self.CHAOS_PROFILES.keys()))
+        profile = self.CHAOS_PROFILES[profile_name]
+        return target, profile
 
     def reset(self) -> None:
         """Reset chaos agent state for a new episode."""
@@ -99,27 +128,14 @@ class ChaosAgent:
         if rng.random() > self.injection_probability:
             return None
 
-        inspected = inspected_services or set()
-
-        # Find candidate services: healthy and not already chaos-injected
-        candidates = []
-        preferred = []  # prefer services NOT being investigated
-        for name, svc in current_services.items():
-            if svc.status == ServiceStatusEnum.HEALTHY and name not in self._injected_services:
-                candidates.append(name)
-                if name not in inspected:
-                    preferred.append(name)
-
-        if not candidates:
+        picked = self._pick_target_and_profile(
+            current_services=current_services,
+            rng=rng,
+            inspected_services=inspected_services,
+        )
+        if picked is None:
             return None
-
-        # Prefer injecting into services the agent isn't looking at
-        target_pool = preferred if preferred else candidates
-        target = rng.choice(target_pool)
-
-        # Pick a random chaos profile
-        profile_name = rng.choice(list(self.CHAOS_PROFILES.keys()))
-        profile = self.CHAOS_PROFILES[profile_name]
+        target, profile = picked
 
         # Apply the failure
         updates = {
@@ -135,6 +151,45 @@ class ChaosAgent:
         current_services[target] = current_services[target].model_copy(update=updates)
         self._injected_services.add(target)
 
+        return target
+
+    def force_random_inject(
+        self,
+        step: int,
+        current_services: Dict[str, ServiceState],
+        rng: random.Random,
+        inspected_services: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """
+        Force exactly one RANDOM chaos injection (random target + random profile).
+
+        This supports a "guarantee at least one chaos event" mode while still
+        keeping the chaos fully random and task-agnostic.
+        """
+        if step < self.min_step:
+            return None
+
+        picked = self._pick_target_and_profile(
+            current_services=current_services,
+            rng=rng,
+            inspected_services=inspected_services,
+        )
+        if picked is None:
+            return None
+        target, profile = picked
+
+        updates = {
+            "status": profile["status"],
+            "error_rate": profile["error_rate"],
+            "latency_ms": profile["latency_ms"],
+            "cpu_percent": profile["cpu_percent"],
+            "memory_percent": profile["memory_percent"],
+        }
+        if "instances" in profile:
+            updates["instances"] = profile["instances"]
+
+        current_services[target] = current_services[target].model_copy(update=updates)
+        self._injected_services.add(target)
         return target
 
     def force_inject(

@@ -244,8 +244,8 @@ def _build_hard_task() -> TaskDefinition:
 
 def _build_chaos_cascade_task() -> TaskDefinition:
     """
-    DB fails first. At step 8 a chaos event fires: notification also fails.
-    Agent must handle both failures. The "wow" demo task.
+    DB fails first. With chaos_mode enabled, the ChaosAgent may inject additional
+    random failures mid-episode (no hardcoded scripted failures).
     """
     services = {
         "database": ServiceState(
@@ -290,22 +290,20 @@ def _build_chaos_cascade_task() -> TaskDefinition:
         name="chaos_cascade",
         description=(
             "The database has crashed, taking auth, payments, and checkout down with it. "
-            "A secondary chaos event will inject a notification failure mid-episode. "
-            "Handle both the primary and secondary failures to fully restore the system."
+            "With Chaos Mode enabled, additional random failures may be injected mid-episode. "
+            "Restore the system to full health."
         ),
         difficulty="hard",
         max_steps=35,
         root_cause_service="database",
         root_cause_description=(
-            "Database crashed under extreme load. Notification service will independently "
-            "fail at step 8 due to chaos injection."
+            "Database crashed under extreme load. Chaos Mode may inject additional random failures."
         ),
         correct_recovery_actions=[
             "restart_service:database",
             "restart_service:auth",
             "restart_service:payments",
             "restart_service:checkout",
-            "restart_service:notification",
         ],
         initial_services=services,
         time_limit_seconds=300,

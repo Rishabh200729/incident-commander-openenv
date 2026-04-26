@@ -27,12 +27,10 @@ from typing import Any, Dict, List, Optional
 
 try:
     from openai import OpenAI
+    _HAS_OPENAI = True
 except ImportError:
-    print(
-        "ERROR: 'openai' package is required. Install with: pip install openai>=1.0.0",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    _HAS_OPENAI = False
+    OpenAI = None  # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -52,9 +50,127 @@ except ImportError:
 
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://api.openai.com/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "gpt-4o-mini"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-1.5B-Instruct"
 BENCHMARK_NAME = "incident_commander_env"
 MAX_RETRIES = 3
+
+# Import training prompt builder for --local mode (must match training distribution)
+try:
+    from train_grpo import build_obs_prompt as _training_prompt_builder
+except ImportError:
+    _training_prompt_builder = None
+
+
+# ---------------------------------------------------------------------------
+# Local model loader (for --local mode)
+# ---------------------------------------------------------------------------
+
+_local_model = None
+_local_tokenizer = None
+
+
+def load_local_model(base_model: str, adapter_path: str, device: str):
+    """Load base model + LoRA adapter for local inference."""
+    global _local_model, _local_tokenizer
+
+    if _local_model is not None:
+        return _local_model, _local_tokenizer
+
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
+    except ImportError as e:
+        print(f"ERROR: Missing dependency for --local mode: {e}", file=sys.stderr)
+        print("Install: pip install transformers peft torch accelerate", file=sys.stderr)
+        sys.exit(1)
+
+    from pathlib import Path
+    adapter_dir = Path(adapter_path)
+    if not adapter_dir.exists():
+        print(f"\n\u274c Adapter not found at '{adapter_path}'", file=sys.stderr)
+        sys.exit(1)
+
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+    print(f"\n  Loading trained model on {device}...")
+
+    dtype = torch.float32
+    if device == "mps":
+        dtype = torch.float16
+    elif device == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    _local_tokenizer = AutoTokenizer.from_pretrained(base_model)
+    if _local_tokenizer.pad_token is None:
+        _local_tokenizer.pad_token = _local_tokenizer.eos_token
+
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model, torch_dtype=dtype,
+        device_map=device if device != "mps" else None,
+    )
+    if device == "mps":
+        base = base.to("mps")
+
+    _local_model = PeftModel.from_pretrained(base, adapter_path)
+    _local_model.eval()
+
+    param_count = sum(p.numel() for p in _local_model.parameters())
+    print(f"  \u2705 Model loaded: {param_count:,} params on {device}")
+
+    return _local_model, _local_tokenizer
+
+
+def generate_local_action(
+    model, tokenizer,
+    obs_dict, step, action_history,
+    deterministic: bool = True,
+) -> str:
+    """Generate action using the trained model with TRAINING-ALIGNED prompts."""
+    import torch
+
+    if _training_prompt_builder is None:
+        raise RuntimeError("Cannot import train_grpo.build_obs_prompt for local inference")
+
+    prompt_text = _training_prompt_builder(obs_dict, step, action_history)
+    messages = [{"role": "user", "content": prompt_text}]
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        input_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        input_text = prompt_text
+
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    gen_kwargs = {
+        "max_new_tokens": 128,
+        "pad_token_id": tokenizer.pad_token_id,
+        "repetition_penalty": 1.0,
+    }
+    if deterministic:
+        gen_kwargs["do_sample"] = False
+        gen_kwargs["temperature"] = 1.0
+        gen_kwargs["top_p"] = 1.0
+        gen_kwargs["top_k"] = None
+    else:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = 0.2
+        gen_kwargs["top_p"] = 0.9
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+
+    generated = outputs[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +465,11 @@ SPECIALIST_PROMPTS = {
 
 def run_multi_agent_task(
     task_name: str,
-    client: OpenAI,
+    client=None,
     chaos_mode: bool = False,
     verbose: bool = True,
+    local_model=None,
+    local_tokenizer=None,
 ) -> Dict[str, Any]:
     """
     Run a single task episode using the coordinator-specialist architecture.
@@ -364,7 +482,9 @@ def run_multi_agent_task(
     action_history: List[str] = []
     steps = 0
 
-    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={MODEL_NAME} mode=multi_agent", flush=True)
+    use_local = local_model is not None
+    mode_str = "local" if use_local else MODEL_NAME
+    print(f"[START] task={task_name} env={BENCHMARK_NAME} model={mode_str} mode=multi_agent", flush=True)
 
     try:
         obs = env.reset(task_name=task_name, chaos_mode=chaos_mode)
@@ -377,70 +497,114 @@ def run_multi_agent_task(
             for name, prompt in SPECIALIST_PROMPTS.items()
         }
 
+        # Import orchestrator for hybrid mode
+        from server.tasks import get_task
+        from orchestrator import orchestrated_action as _orchestrated_action
+        task = get_task(task_name)
+
         while not obs.done:
             steps += 1
 
-            # Step 1: Coordinator decides delegation
-            coord_prompt = observation_to_prompt(obs_dict, steps, action_history)
-            coordinator_messages.append({"role": "user", "content": coord_prompt})
-
-            delegation = None
-            for attempt in range(MAX_RETRIES):
-                try:
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=coordinator_messages,
-                        temperature=0.0,
-                        max_tokens=128,
-                    )
-                    response_text = completion.choices[0].message.content or ""
-                    delegation = parse_delegation(response_text)
-                    if delegation:
-                        coordinator_messages.append({"role": "assistant", "content": response_text})
-                        break
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        print(f"WARNING: Coordinator LLM failed: {e}", file=sys.stderr)
-
-            if delegation is None:
+            if use_local:
+                # --- Local model path: use trained Qwen + orchestrator ---
+                # Step 1: Coordinator is heuristic (no separate LLM call)
                 specialist_name = fallback_delegation(obs_dict)
-                context = "fallback heuristic"
+                context = "local-heuristic"
+
+                delegations.append(specialist_name)
+                if verbose:
+                    print(f"  [COORD] → {specialist_name}: {context}", flush=True)
+
+                # Step 2: Specialist = trained local model
+                model_action = None
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        response_text = generate_local_action(
+                            local_model, local_tokenizer,
+                            obs_dict, steps, action_history,
+                        )
+                        model_action = parse_action(response_text)
+                        if model_action:
+                            break
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            print(f"WARNING: Local model failed: {e}", file=sys.stderr)
+
+                # Route through orchestrator (hybrid decision)
+                decision = _orchestrated_action(
+                    model_action=model_action,
+                    obs_dict=obs_dict,
+                    step=steps,
+                    action_history=action_history,
+                    task=task,
+                )
+                action = decision.action
+                if verbose and not decision.used_model:
+                    print(f"  [ORCH] ⚠️ OVERRIDE({decision.reason})", flush=True)
+
             else:
-                specialist_name = delegation.get("delegate_to", "infra_expert")
-                context = delegation.get("context", "")
-                if specialist_name not in SPECIALIST_PROMPTS:
-                    specialist_name = "infra_expert"
+                # --- API path: full multi-agent with coordinator ---
+                # Step 1: Coordinator decides delegation
+                coord_prompt = observation_to_prompt(obs_dict, steps, action_history)
+                coordinator_messages.append({"role": "user", "content": coord_prompt})
 
-            delegations.append(specialist_name)
-            if verbose:
-                print(f"  [COORD] → {specialist_name}: {context}", flush=True)
+                delegation = None
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        completion = client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=coordinator_messages,
+                            temperature=0.0,
+                            max_tokens=128,
+                        )
+                        response_text = completion.choices[0].message.content or ""
+                        delegation = parse_delegation(response_text)
+                        if delegation:
+                            coordinator_messages.append({"role": "assistant", "content": response_text})
+                            break
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            print(f"WARNING: Coordinator LLM failed: {e}", file=sys.stderr)
 
-            # Step 2: Specialist picks action
-            spec_messages = specialist_messages[specialist_name]
-            spec_prompt = observation_to_prompt(obs_dict, steps, action_history, specialist=specialist_name)
-            spec_messages.append({"role": "user", "content": spec_prompt})
+                if delegation is None:
+                    specialist_name = fallback_delegation(obs_dict)
+                    context = "fallback heuristic"
+                else:
+                    specialist_name = delegation.get("delegate_to", "infra_expert")
+                    context = delegation.get("context", "")
+                    if specialist_name not in SPECIALIST_PROMPTS:
+                        specialist_name = "infra_expert"
 
-            action = None
-            for attempt in range(MAX_RETRIES):
-                try:
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=spec_messages,
-                        temperature=0.0,
-                        max_tokens=256,
-                    )
-                    response_text = completion.choices[0].message.content or ""
-                    action = parse_action(response_text)
-                    if action:
-                        spec_messages.append({"role": "assistant", "content": response_text})
-                        break
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        print(f"WARNING: {specialist_name} LLM failed: {e}", file=sys.stderr)
+                delegations.append(specialist_name)
+                if verbose:
+                    print(f"  [COORD] → {specialist_name}: {context}", flush=True)
 
-            if action is None:
-                # Fallback: use infra expert's basic heuristic
-                action = IncidentAction(action_type=ActionType.DO_NOTHING)
+                # Step 2: Specialist picks action
+                spec_messages = specialist_messages[specialist_name]
+                spec_prompt = observation_to_prompt(obs_dict, steps, action_history, specialist=specialist_name)
+                spec_messages.append({"role": "user", "content": spec_prompt})
+
+                action = None
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        completion = client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=spec_messages,
+                            temperature=0.0,
+                            max_tokens=256,
+                        )
+                        response_text = completion.choices[0].message.content or ""
+                        action = parse_action(response_text)
+                        if action:
+                            spec_messages.append({"role": "assistant", "content": response_text})
+                            break
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            print(f"WARNING: {specialist_name} LLM failed: {e}", file=sys.stderr)
+
+                if action is None:
+                    # Fallback: use infra expert's basic heuristic
+                    action = IncidentAction(action_type=ActionType.DO_NOTHING)
 
             # Build action string
             action_str = action.action_type.value
@@ -521,21 +685,44 @@ def main():
     parser.add_argument("--task", type=str, default=None, help="Specific task to run (default: all)")
     parser.add_argument("--chaos", action="store_true", help="Enable chaos mode")
     parser.add_argument("--quiet", action="store_true", help="Hide coordinator delegation logs")
+    parser.add_argument("--local", action="store_true",
+                        help="Use local trained model instead of API")
+    parser.add_argument("--base-model", type=str, default="sft_merged_1p5b_v5",
+                        help="Base model for --local mode")
+    parser.add_argument("--adapter", type=str, default="trained_model_1p5b_v5",
+                        help="LoRA adapter path for --local mode")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda", "mps"],
+                        help="Device for --local mode (default: auto-detect)")
     args = parser.parse_args()
 
-    if not API_KEY:
-        print("WARNING: No HF_TOKEN or API_KEY set.", file=sys.stderr)
+    local_model = None
+    local_tokenizer = None
+    client = None
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    if args.local:
+        local_model, local_tokenizer = load_local_model(
+            args.base_model, args.adapter, args.device
+        )
+    else:
+        if not _HAS_OPENAI:
+            print("ERROR: 'openai' package required for API mode. "
+                  "Use --local for local model or: pip install openai>=1.0.0",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not API_KEY:
+            print("WARNING: No HF_TOKEN or API_KEY set.", file=sys.stderr)
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     if args.task:
         tasks = [args.task]
     else:
         tasks = list_tasks()
 
+    mode_str = "LOCAL" if args.local else MODEL_NAME
     print(f"\n{'='*60}")
     print(f"  Multi-Specialist Agent — Incident Commander")
-    print(f"  Model: {MODEL_NAME} | Chaos: {args.chaos}")
+    print(f"  Model: {mode_str} | Chaos: {args.chaos}")
     print(f"  Tasks: {tasks}")
     print(f"{'='*60}\n")
 
@@ -546,6 +733,8 @@ def main():
             client,
             chaos_mode=args.chaos,
             verbose=not args.quiet,
+            local_model=local_model,
+            local_tokenizer=local_tokenizer,
         )
         results.append(result)
         print()

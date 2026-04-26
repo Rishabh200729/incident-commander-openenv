@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/+$/, '') || 'http://localhost:8000';
+
 export type ServiceStatus = 'healthy' | 'degraded' | 'down';
 
 export interface ServiceState {
@@ -22,11 +25,20 @@ export interface TimelineEvent {
   health?: number;
   description?: string;
   affected_services?: string[];
+  chaos_event?: string;
   // Legacy fields kept for compatibility
   actor?: string;
   details?: Record<string, any>;
   // Injected by the hook: marks brand-new entries for animation
   isNew?: boolean;
+}
+
+export interface RunbookEntry {
+  fingerprint?: string;
+  task_name?: string;
+  root_cause?: string;
+  fix_sequence?: string[];
+  score?: number;
 }
 
 export interface IncidentState {
@@ -38,6 +50,10 @@ export interface IncidentState {
   actions_taken: string[];
   services: Record<string, ServiceState>;
   incident_timeline: TimelineEvent[];
+  runbook_memory?: RunbookEntry[];
+  escalation_tier?: number;
+  services_at_risk?: string[];
+  metadata?: Record<string, any>;
 }
 
 export interface HistoryPoint {
@@ -46,12 +62,45 @@ export interface HistoryPoint {
   health: number;
 }
 
+export interface ScoreBreakdown {
+  recovery: number;
+  efficiency: number;
+  diagnostics: number;
+  ordering: number;
+  memory: number;
+}
+
+export interface AutoPilotStep {
+  action: Record<string, string>;
+  routing: { used_model: boolean; reason: string };
+  reward: number;
+  done: boolean;
+  system_health: number;
+}
+
+export interface ModelConfig {
+  base_model: string;
+  adapter_path: string;
+  device: 'auto' | 'cpu' | 'cuda' | 'mps';
+}
+
 interface UseEnvironmentReturn {
   state: IncidentState | null;
   isConnected: boolean;
   error: string | null;
   rewardHistory: HistoryPoint[];
-  resetEnvironment: (taskName?: string) => Promise<void>;
+  resetEnvironment: (taskName?: string, chaosMode?: boolean) => Promise<void>;
+  // Auto-pilot
+  isAutoPilotRunning: boolean;
+  startAutoPilot: (opts?: { ensureReset?: () => Promise<void>; modelConfig?: ModelConfig }) => void;
+  stopAutoPilot: () => void;
+  autoPilotSteps: AutoPilotStep[];
+  // Live score
+  liveScore: { score: number; breakdown: ScoreBreakdown } | null;
+  fetchLiveScore: () => Promise<void>;
+  // Model info
+  modelInfo: any | null;
+  fetchModelInfo: () => Promise<void>;
 }
 
 export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
@@ -68,9 +117,20 @@ export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
   // Track episode id to reset the "new" count when episode changes
   const prevEpisodeId = useRef<string | null>(null);
 
+  // Auto-pilot state
+  const [isAutoPilotRunning, setIsAutoPilotRunning] = useState(false);
+  const autoPilotRef = useRef(false);
+  const [autoPilotSteps, setAutoPilotSteps] = useState<AutoPilotStep[]>([]);
+
+  // Live score state
+  const [liveScore, setLiveScore] = useState<{ score: number; breakdown: ScoreBreakdown } | null>(null);
+
+  // Model info (backend lazy-load status)
+  const [modelInfo, setModelInfo] = useState<any | null>(null);
+
   const fetchState = useCallback(async () => {
     try {
-      const response = await fetch('http://localhost:8000/state');
+      const response = await fetch(`${API_BASE}/state`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -93,7 +153,6 @@ export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
       prevTimelineLen.current = timeline.length;
 
       // Build reward+health history from timeline health snapshots + live cumulative reward
-      // Each timeline event has a `health` field (0-1). We map step → health.
       const timelineHealthMap = new Map<number, number>();
       for (const evt of timeline) {
         if (evt.health != null) {
@@ -131,17 +190,24 @@ export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
     }
   }, []);
 
-  const resetEnvironment = useCallback(async (taskName?: string | any) => {
+  const resetEnvironment = useCallback(async (taskName?: string | any, chaosMode?: boolean) => {
     // React's onClick passes an Event object, so we must check if it's actually a string
     const finalTaskName = typeof taskName === 'string' ? taskName : 'random_incident';
+    const finalChaos = typeof chaosMode === 'boolean' ? chaosMode : false;
+
+    // Stop auto-pilot on reset
+    autoPilotRef.current = false;
+    setIsAutoPilotRunning(false);
+    setAutoPilotSteps([]);
+    setLiveScore(null);
 
     try {
-      const response = await fetch('http://localhost:8000/reset', {
+      const response = await fetch(`${API_BASE}/reset`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ task_name: finalTaskName })
+        body: JSON.stringify({ task_name: finalTaskName, chaos_mode: finalChaos })
       });
       if (!response.ok) {
         throw new Error(`Reset failed: ${response.status}`);
@@ -151,6 +217,98 @@ export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
       console.error('Failed to reset environment:', e);
     }
   }, [fetchState]);
+
+  const fetchLiveScore = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/score`);
+      if (response.ok) {
+        const data = await response.json();
+        setLiveScore({ score: data.score, breakdown: data.breakdown });
+      }
+    } catch (e) {
+      // Silently fail — score is optional
+    }
+  }, []);
+
+  const fetchModelInfo = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/model/info`);
+      if (response.ok) {
+        const data = await response.json();
+        setModelInfo(data);
+      }
+    } catch (e) {
+      // optional
+    }
+  }, []);
+
+  // Auto-pilot: call /predict_and_step in a loop
+  const startAutoPilot = useCallback((opts?: { ensureReset?: () => Promise<void>; modelConfig?: ModelConfig }) => {
+    autoPilotRef.current = true;
+    setIsAutoPilotRunning(true);
+    setAutoPilotSteps([]);
+
+    const runStep = async () => {
+      if (!autoPilotRef.current) return;
+
+      try {
+        // If caller asked to ensure a reset (episode initialized), do it once.
+        if (opts?.ensureReset) {
+          await opts.ensureReset();
+          opts.ensureReset = undefined;
+        }
+
+        const response = await fetch(`${API_BASE}/predict_and_step`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(opts?.modelConfig ?? {}),
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          setError(`Auto-Pilot failed (${response.status}): ${text}`);
+          autoPilotRef.current = false;
+          setIsAutoPilotRunning(false);
+          return;
+        }
+
+        const data = await response.json();
+        setAutoPilotSteps(prev => [...prev, {
+          action: data.action_taken,
+          routing: data.routing,
+          reward: data.reward,
+          done: data.done,
+          system_health: data.system_health,
+        }]);
+
+        // Refresh state and score
+        await fetchState();
+        await fetchLiveScore();
+        await fetchModelInfo();
+
+        if (data.done || !autoPilotRef.current) {
+          autoPilotRef.current = false;
+          setIsAutoPilotRunning(false);
+          return;
+        }
+
+        // Small delay between steps for visual effect
+        setTimeout(runStep, 800);
+      } catch (e) {
+        console.error('Auto-pilot step failed:', e);
+        setError(e instanceof Error ? e.message : 'Auto-Pilot failed');
+        autoPilotRef.current = false;
+        setIsAutoPilotRunning(false);
+      }
+    };
+
+    runStep();
+  }, [fetchState, fetchLiveScore, fetchModelInfo]);
+
+  const stopAutoPilot = useCallback(() => {
+    autoPilotRef.current = false;
+    setIsAutoPilotRunning(false);
+  }, []);
 
   useEffect(() => {
     // Initial fetch
@@ -162,5 +320,10 @@ export function useEnvironment(pollingIntervalMs = 800): UseEnvironmentReturn {
     return () => clearInterval(intervalId);
   }, [fetchState, pollingIntervalMs]);
 
-  return { state, isConnected, error, rewardHistory, resetEnvironment };
+  return {
+    state, isConnected, error, rewardHistory, resetEnvironment,
+    isAutoPilotRunning, startAutoPilot, stopAutoPilot, autoPilotSteps,
+    liveScore, fetchLiveScore,
+    modelInfo, fetchModelInfo,
+  };
 }

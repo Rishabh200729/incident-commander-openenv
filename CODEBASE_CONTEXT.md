@@ -84,7 +84,7 @@ Requires `OPENAI_API_KEY` in `.env`. This is an optional demo feature, not used 
 ### Core Environment (`server/`)
 | File | Purpose |
 |------|---------|
-| `server/app.py` | FastAPI HTTP API — `/reset`, `/step`, `/state`, `/predict`, `/dashboard` |
+| `server/app.py` | FastAPI HTTP API — `/reset`, `/step`, `/state`, `/predict`, `/predict_and_step`, `/report`, `/score`, `/dashboard`, `/model/info`, `/timeline` |
 | `server/environment.py` | Core simulation loop, observation generation, step execution. **Has grace-step logic for write_runbook.** |
 | `server/models.py` | Pydantic models: `IncidentAction`, `IncidentObservation`, `IncidentState`, `ActionType` |
 | `server/services.py` | Service simulation, health computation, dependency graph |
@@ -109,7 +109,7 @@ Requires `OPENAI_API_KEY` in `.env`. This is an optional demo feature, not used 
 | `evaluate.py` | Expert/naive strategy definitions, `run_strategy` helper |
 | `run_baselines.py` | Multi-agent baseline benchmarking (random, heuristic, LLM, trained) |
 | `orchestrator.py` | **Hybrid routing policy** (model + deterministic expert), diagnostics guarantees + guardrails |
-| `multi_agent_inference.py` | Coordinator-specialist multi-agent architecture (GPT-4o-mini based) |
+| `multi_agent_inference.py` | Coordinator-specialist multi-agent architecture (GPT-4o-mini API based, or `--local` trained Qwen model) |
 | `plot_training.py` | Generates training evidence plots (reward curve, loss, baseline comparison, score breakdown, pipeline overview) |
 
 ### Config & Deployment
@@ -382,15 +382,15 @@ https://colab.research.google.com/github/hs-zz27/incident-commander-openenv/blob
 - [ ] Run Colab notebook end-to-end for filled output cells
 - [ ] Write HuggingFace mini-blog post (30% of judging score)
 - [ ] Polish README.md with v5 results table + architecture diagram + links
-- [ ] Generate final training evidence plots with `plot_training.py`
-- [ ] Add frontend interactive controls (scenario selector + auto-pilot button)
-
 ### Done
+- [x] Added frontend interactive controls (scenario selector + chaos toggle + auto-pilot button)
+- [x] Added post-incident report modal & live score gauge
+- [x] Added confidence score to API, enriched `/state` with runbook memory & escalation
 - [x] Trained 1.5B model with GRPO — 0.815 avg score, 25/25 resolved
 - [x] Implemented write_runbook grace step — memory score now 0.050 everywhere
 - [x] Created Colab training notebook for judges
 - [x] Configurable LoRA rank/alpha CLI args + MLP targeting for bigger models
-- [x] Multi-agent coordinator-specialist architecture
+- [x] Multi-agent coordinator-specialist architecture (now with `--local` Qwen support)
 - [x] Hybrid orchestrator (model + heuristic routing)
 - [x] Fixed GRPO mode collapse: removed alignment bonus, added temperature=1.0
 - [x] Created plot_training.py for training evidence visualization

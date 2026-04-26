@@ -72,3 +72,4 @@ sft_dataset.json
 frontend_app/node_modules/
 frontend_app/.next/
 grpo_training_logs.txt
+sft_training_logs_1b5.txt

@@ -117,6 +117,12 @@ class TestEasyTask:
         ))
         assert obs.services["cache"].status == ServiceStatusEnum.HEALTHY
         assert obs.system_health_score > 0.9
+        # Grace step: allow write_runbook after recovery.
+        assert obs.done is False
+        obs = env.step(IncidentAction(
+            action_type=ActionType.WRITE_RUNBOOK,
+            metadata={"summary": "Root cause: cache OOM crash"},
+        ))
         assert obs.done is True
 
     def test_grade_after_solve(self, env):
@@ -124,9 +130,14 @@ class TestEasyTask:
         env.step(IncidentAction(
             action_type=ActionType.INSPECT_LOGS, service_name="cache"
         ))
-        env.step(IncidentAction(
+        obs = env.step(IncidentAction(
             action_type=ActionType.RESTART_SERVICE, service_name="cache"
         ))
+        if not obs.done:
+            env.step(IncidentAction(
+                action_type=ActionType.WRITE_RUNBOOK,
+                metadata={"summary": "Root cause: cache OOM crash"},
+            ))
         grade = env.grade()
         assert grade["is_resolved"] is True
         assert grade["score"] >= 0.80
@@ -163,7 +174,11 @@ class TestMediumTask:
         obs = env.step(IncidentAction(
             action_type=ActionType.RESTART_SERVICE, service_name="checkout"
         ))
-        assert obs.done is True
+        assert obs.done is False
+        env.step(IncidentAction(
+            action_type=ActionType.WRITE_RUNBOOK,
+            metadata={"summary": "Root cause: database overload; scale+restart then restart dependents"},
+        ))
         grade = env.grade()
         assert grade["is_resolved"] is True
         assert grade["score"] >= 0.70

@@ -80,10 +80,10 @@ class TaskListResponse(BaseModel):
 
 class PredictRequest(BaseModel):
     base_model: str = Field(
-        default="Qwen/Qwen2.5-0.5B-Instruct", description="Base model name"
+        default="sft_merged_1p5b_v5", description="Base model name"
     )
     adapter_path: str = Field(
-        default="trained_model_full_0p5b", description="LoRA adapter path"
+        default="trained_model_1p5b_v5", description="LoRA adapter path"
     )
     device: str = Field(default="auto", description="Device: auto, cpu, cuda, mps")
 
@@ -192,7 +192,18 @@ def create_incident_app() -> FastAPI:
     # ---- State ----
     @app.get("/state", response_model=StateResponse)
     async def state():
-        return StateResponse(state=env.state.model_dump())
+        state_dict = env.state.model_dump()
+        # Enrich state with data from the last observation
+        if _last_observation is not None:
+            state_dict["runbook_memory"] = [
+                entry if isinstance(entry, dict) else entry
+                for entry in (_last_observation.runbook_memory or [])
+            ]
+            state_dict["escalation_tier"] = _last_observation.escalation_tier
+            state_dict["services_at_risk"] = _last_observation.services_at_risk
+            # Expose last observation metadata (used for chaos injection indicator).
+            state_dict["metadata"] = _last_observation.metadata or {}
+        return StateResponse(state=state_dict)
 
     # ---- Grade ----
     @app.get("/grade", response_model=GradeResponse)
@@ -505,9 +516,18 @@ def create_incident_app() -> FastAPI:
                 top_p=1.0,
                 repetition_penalty=1.0,
                 pad_token_id=tokenizer.pad_token_id,
+                output_scores=True,
+                return_dict_in_generate=True,
             )
 
-        generated = outputs[0][inputs["input_ids"].shape[1] :]
+        # Compute confidence from generation scores
+        confidence = 0.0
+        if outputs.scores:
+            probs_list = [torch.softmax(s[0], dim=-1) for s in outputs.scores]
+            top_probs = [p.max().item() for p in probs_list]
+            confidence = round(sum(top_probs) / len(top_probs), 4) if top_probs else 0.0
+
+        generated = outputs.sequences[0][inputs["input_ids"].shape[1] :]
         response = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
         # Parse JSON action using the shared fuzzy parser
@@ -560,6 +580,7 @@ def create_incident_app() -> FastAPI:
             "raw_response": response,
             "parsed_action": action_data,
             "routing": {"used_model": decision.used_model, "reason": decision.reason},
+            "confidence": confidence,
             "step": state.step_count + 1,
             "model_device": str(next(model.parameters()).device),
         }
@@ -589,6 +610,7 @@ def create_incident_app() -> FastAPI:
         return {
             "action_taken": action_data,
             "routing": predict_result["routing"],
+            "confidence": predict_result.get("confidence", 0.0),
             "observation": obs_dict,
             "reward": obs.reward,
             "done": obs.done,
@@ -609,6 +631,77 @@ def create_incident_app() -> FastAPI:
             info["device"] = str(next(model.parameters()).device)
             info["param_count"] = sum(p.numel() for p in model.parameters())
         return info
+
+    @app.get("/score")
+    async def live_score():
+        """Return current score breakdown (can be called during an episode)."""
+        result = env.grade()
+        return {
+            "score": result.get("score", 0.0),
+            "breakdown": result.get("breakdown", {}),
+            "steps_taken": result.get("steps_taken", 0),
+            "is_resolved": result.get("is_resolved", False),
+        }
+
+    @app.get("/report")
+    async def incident_report():
+        """Generate a post-incident report for the completed episode."""
+        state = env.state
+        grade_result = env.grade()
+        breakdown = grade_result.get("breakdown", {})
+        timeline = env.timeline
+
+        # Build markdown report
+        lines = []
+        lines.append("# 📋 Post-Incident Report")
+        lines.append(f"\n**Task:** {state.task_name}")
+        lines.append(f"**Episode ID:** {state.episode_id}")
+        lines.append(f"**Status:** {'✅ Resolved' if state.is_resolved else '❌ Unresolved'}")
+        lines.append(f"**Total Steps:** {state.step_count}")
+        lines.append(f"**Overall Score:** {grade_result.get('score', 0):.3f} / 1.000")
+
+        lines.append("\n## Score Breakdown")
+        lines.append("| Component | Score | Max | Notes |")
+        lines.append("|:----------|:------|:----|:------|")
+        component_max = {"recovery": 0.35, "efficiency": 0.20, "diagnostics": 0.15, "ordering": 0.20, "memory": 0.10}
+        for comp, max_val in component_max.items():
+            val = breakdown.get(comp, 0)
+            pct = (val / max_val * 100) if max_val > 0 else 0
+            emoji = "🟢" if pct >= 90 else ("🟡" if pct >= 60 else "🔴")
+            lines.append(f"| {emoji} {comp.title()} | {val:.3f} | {max_val:.2f} | {pct:.0f}% |")
+
+        lines.append("\n## Action Timeline")
+        lines.append("| Step | Action | Health | Reward |")
+        lines.append("|:-----|:-------|:-------|:-------|")
+        for evt in timeline:
+            step = evt.get("step", "?")
+            event = evt.get("event", "unknown")
+            health = evt.get("health", 0)
+            reward = evt.get("reward", 0)
+            if health is not None:
+                lines.append(f"| {step} | {event} | {health:.2%} | {reward:+.3f} |")
+
+        lines.append("\n## Recovery Actions Taken")
+        for i, action in enumerate(state.actions_taken, 1):
+            lines.append(f"{i}. `{action}`")
+
+        # Service final state
+        lines.append("\n## Final Service State")
+        lines.append("| Service | Status | Error Rate | Latency |")
+        lines.append("|:--------|:-------|:-----------|:--------|")
+        for name, svc_data in sorted(state.services.items()):
+            svc = svc_data if isinstance(svc_data, dict) else svc_data.model_dump() if hasattr(svc_data, 'model_dump') else {}
+            status = svc.get("status", "unknown")
+            emoji = "🟢" if status in ("healthy", "ServiceStatusEnum.HEALTHY") else ("🟡" if "degraded" in str(status).lower() else "🔴")
+            err = svc.get("error_rate", 0)
+            lat = svc.get("latency_ms", 0)
+            lines.append(f"| {emoji} {name} | {status} | {err:.1%} | {lat:.0f}ms |")
+
+        lines.append("\n---")
+        lines.append("*Report generated automatically by Incident Commander*")
+
+        report_text = "\n".join(lines)
+        return {"report": report_text, "score": grade_result.get("score", 0), "is_resolved": state.is_resolved}
 
     return app
 

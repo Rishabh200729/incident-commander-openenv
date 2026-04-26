@@ -215,7 +215,11 @@ class TestFullRollouts:
         env.reset(task_name="single_service_failure")
         env.step(IncidentAction(action_type=ActionType.INSPECT_LOGS, service_name="cache"))
         obs = env.step(IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name="cache"))
-        assert obs.done is True
+        assert obs.done is False
+        env.step(IncidentAction(
+            action_type=ActionType.WRITE_RUNBOOK,
+            metadata={"summary": "Root cause: cache OOM crash"},
+        ))
         grade = env.grade()
         assert grade["score"] >= 0.80  # adjusted for grader rebalance (Memory component)
         assert grade["is_resolved"] is True
@@ -229,7 +233,11 @@ class TestFullRollouts:
         env.step(IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name="auth"))
         env.step(IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name="payments"))
         obs = env.step(IncidentAction(action_type=ActionType.RESTART_SERVICE, service_name="checkout"))
-        assert obs.done is True
+        assert obs.done is False
+        env.step(IncidentAction(
+            action_type=ActionType.WRITE_RUNBOOK,
+            metadata={"summary": "Root cause: database overload; scale+restart then restart dependents"},
+        ))
         grade = env.grade()
         assert grade["score"] >= 0.80
         assert grade["is_resolved"] is True
